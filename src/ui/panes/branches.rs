@@ -4,7 +4,7 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph},
+    widgets::{Block, Borders, List, ListItem},
     Frame,
 };
 
@@ -12,18 +12,19 @@ use crate::{
     app::{App, BranchAction, Pane},
     gh::{Pr, PrState},
     git::Branch,
-    ui::theme::Theme,
+    ui::{theme::Theme, toolbar},
 };
 
-/// Toolbar definition. Order is what the user sees left-to-right.
+/// Toolbar definition. Order is what the user sees left-to-right. Each label
+/// gets a leading icon so the chips read as actions at a glance.
 const BUTTONS: &[(&str, BranchAction)] = &[
-    ("checkout", BranchAction::Checkout),
+    ("✓ checkout", BranchAction::Checkout),
     ("+ new", BranchAction::NewBranch),
-    ("push", BranchAction::Push),
-    ("pull", BranchAction::Pull),
-    ("fetch", BranchAction::Fetch),
-    ("merge", BranchAction::Merge),
-    ("delete", BranchAction::Delete),
+    ("⇡ push", BranchAction::Push),
+    ("⇣ pull", BranchAction::Pull),
+    ("↻ fetch", BranchAction::Fetch),
+    ("⇆ merge", BranchAction::Merge),
+    ("✗ delete", BranchAction::Delete),
 ];
 
 pub fn render(app: &mut App, area: Rect, frame: &mut Frame, theme: &Theme) {
@@ -38,14 +39,19 @@ pub fn render(app: &mut App, area: Rect, frame: &mut Frame, theme: &Theme) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // Carve inner: 1 row for the toolbar, rest for the branches list.
-    let toolbar_h: u16 = 1;
+    // Pack the buttons into rows that fit the pane width. Every button is
+    // always shown; if the pane is narrow they wrap to additional rows.
+    let packed = toolbar::pack(BUTTONS, inner);
+    let toolbar_h = toolbar::rows_used(&packed, inner);
+
     if inner.height < toolbar_h + 1 {
         // Pane too short — skip toolbar entirely so the list still renders.
         app.branch_button_rects.clear();
+        app.last_rects.branches_list = inner;
         render_list(app, inner, frame, theme);
         return;
     }
+
     let toolbar_area = Rect {
         x: inner.x,
         y: inner.y,
@@ -59,52 +65,15 @@ pub fn render(app: &mut App, area: Rect, frame: &mut Frame, theme: &Theme) {
         height: inner.height - toolbar_h,
     };
 
-    render_button_bar(app, toolbar_area, frame, theme);
+    let bg_style = Style::default().bg(theme.bg).fg(theme.fg_dim);
+    toolbar::render(&packed, button_style, bg_style, toolbar_area, frame);
+    app.branch_button_rects = packed
+        .iter()
+        .map(|p| (p.action, p.rect))
+        .collect();
+
+    app.last_rects.branches_list = list_area;
     render_list(app, list_area, frame, theme);
-}
-
-/// Render the clickable toolbar of branch actions and record each button's
-/// rect on `app.branch_button_rects` so the click handler can hit-test.
-fn render_button_bar(app: &mut App, area: Rect, frame: &mut Frame, theme: &Theme) {
-    let mut button_rects: Vec<(BranchAction, Rect)> = Vec::with_capacity(BUTTONS.len());
-    let mut spans: Vec<Span<'static>> = Vec::with_capacity(BUTTONS.len() * 2);
-    let mut x = area.x;
-    let area_right = area.x + area.width;
-
-    for (label, action) in BUTTONS {
-        let text = format!(" {label} ");
-        let w = text.chars().count() as u16;
-        if x + w > area_right {
-            break; // ran out of horizontal space — show what fits
-        }
-        spans.push(Span::styled(text, button_style(*action)));
-        button_rects.push((
-            *action,
-            Rect {
-                x,
-                y: area.y,
-                width: w,
-                height: 1,
-            },
-        ));
-        x += w;
-        // 1-col gap between buttons; skip if there's no room.
-        if x + 1 < area_right {
-            spans.push(Span::raw(" "));
-            x += 1;
-        }
-    }
-
-    // Pad remainder so background colour doesn't bleed past last button.
-    if x < area_right {
-        spans.push(Span::styled(
-            " ".repeat((area_right - x) as usize),
-            Style::default().bg(theme.bg).fg(theme.fg_dim),
-        ));
-    }
-
-    app.branch_button_rects = button_rects;
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// Per-action button colour. Same family as the rest of the pill palette so

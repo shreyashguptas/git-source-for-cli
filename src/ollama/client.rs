@@ -85,6 +85,12 @@ pub async fn generate_stream(
             "num_predict": 256,
             "temperature": 0.2,
         },
+        // Unload the model from memory immediately after this request
+        // finishes. Without this, Ollama keeps the model resident for ~5
+        // minutes; for a one-shot commit message that's wasted RAM. The
+        // tradeoff is a cold start on the next generation, but the user has
+        // explicitly asked us to free the cache.
+        "keep_alive": 0,
     }))
     .context("building generate request body")?;
 

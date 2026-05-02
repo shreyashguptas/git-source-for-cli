@@ -82,6 +82,28 @@ where
         .collect())
 }
 
+/// Recent commit subjects from HEAD, newest first. Used as a style anchor
+/// for AI-generated commit messages so the model matches the repo's voice
+/// (conventional commits, prefix style, tense, etc.) without per-repo config.
+/// Empty on any error or in an unborn repo — callers treat this as best-effort.
+pub async fn recent_subjects(repo_root: &Path, limit: usize) -> Vec<String> {
+    let limit_arg = format!("-{limit}");
+    match exec::run_optional(
+        repo_root,
+        ["log", &limit_arg, "--pretty=format:%s", "HEAD"],
+    )
+    .await
+    {
+        Ok(Some(out)) => out
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(String::from)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// SHAs that are reachable from HEAD but NOT from HEAD's upstream — i.e.
 /// commits the current branch has that origin doesn't.
 ///

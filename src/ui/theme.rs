@@ -18,6 +18,10 @@ pub struct Theme {
     pub modified: Color,
     pub added: Color,
     pub deleted: Color,
+    pub added_bg: Color,
+    pub deleted_bg: Color,
+    pub added_fg: Color,
+    pub deleted_fg: Color,
     pub renamed: Color,
     pub toast_bg: Color,
 }
@@ -40,6 +44,10 @@ impl Theme {
             modified: Color::Rgb(0xE2, 0xC0, 0x8D),
             added: Color::Rgb(0x73, 0xC9, 0x91),
             deleted: Color::Rgb(0xF4, 0x47, 0x47),
+            added_bg: Color::Rgb(0x14, 0x3D, 0x24),
+            deleted_bg: Color::Rgb(0x4D, 0x1B, 0x21),
+            added_fg: Color::Rgb(0xB8, 0xEA, 0xC2),
+            deleted_fg: Color::Rgb(0xF8, 0xC0, 0xC0),
             renamed: Color::Rgb(0x4F, 0xC1, 0xFF),
             toast_bg: Color::Rgb(0x5A, 0x1D, 0x1D),
         }

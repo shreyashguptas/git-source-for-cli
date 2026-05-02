@@ -13,7 +13,7 @@ use ratatui::{
 
 use crate::{
     app::{App, Pane},
-    ui::{panes::details::lines_from_content, theme::Theme},
+    ui::{panes::details::lines_from_content_padded, theme::Theme},
 };
 
 pub fn render(app: &App, area: Rect, frame: &mut Frame, theme: &Theme) {
@@ -35,7 +35,7 @@ pub fn render(app: &App, area: Rect, frame: &mut Frame, theme: &Theme) {
     frame.render_widget(block, area);
 
     let lines: Vec<Line<'_>> = match &app.preview {
-        Some(c) => lines_from_content(c, theme),
+        Some(c) => lines_from_content_padded(c, theme, inner_area.width),
         None => vec![Line::from(Span::styled(
             hint_text(app.active_pane),
             Style::default().fg(theme.fg_dim),

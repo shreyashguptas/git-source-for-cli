@@ -40,6 +40,16 @@ pub struct Row {
 
 /// Compute the per-row layout for a slice of commits in date order (newest first).
 pub fn layout(commits: &[Commit]) -> Vec<Row> {
+    // Pre-index every commit that owns a branch ref. Lets a freshly-spawned
+    // side lane adopt its branch name as its colour seed from row 1 instead
+    // of waiting until its tip commit is processed — without this, the merge
+    // arm's `╮` is coloured by the parent SHA hash and the next row's `●` by
+    // the branch-name hash, so the lane appears to change colour mid-graph.
+    let sha_to_seed: HashMap<&str, String> = commits
+        .iter()
+        .filter_map(|c| preferred_seed(&c.refs).map(|s| (c.hash.as_str(), s)))
+        .collect();
+
     let mut lanes: Vec<Option<String>> = Vec::new();
     let mut lane_keys: Vec<String> = Vec::new();
     let mut hash_to_lane: HashMap<String, usize> = HashMap::new();
@@ -134,7 +144,17 @@ pub fn layout(commits: &[Commit]) -> Vec<Row> {
                 Some(l) => l,
                 None => first_free_lane(&lanes),
             };
-            ensure_lane(&mut lanes, &mut lane_keys, l, parent);
+            // Seed with the branch name when we know it; falls back to the
+            // parent's SHA so unfamiliar tips still get a stable colour.
+            let seed = sha_to_seed
+                .get(parent.as_str())
+                .map(String::as_str)
+                .unwrap_or(parent.as_str());
+            // Force the seed even if the slot was just absorbed (its old SHA
+            // seed is stale) — this is what keeps the spawn glyph the same
+            // colour as the rest of the side branch.
+            ensure_lane(&mut lanes, &mut lane_keys, l, seed);
+            ensure_lane_key_force(&mut lane_keys, l, seed);
             lanes[l] = Some(parent.clone());
             hash_to_lane.insert(parent.clone(), l);
             spawned.push(l);

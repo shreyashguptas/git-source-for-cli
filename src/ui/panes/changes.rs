@@ -2,20 +2,233 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem},
+    widgets::{Block, Borders, List, ListItem, Paragraph},
     Frame,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
-    app::{App, Pane},
+    app::{is_fully_staged, App, ChangeAction, InputMode, Pane},
     git::{ChangeKind, FileChange},
-    ui::theme::Theme,
+    ui::{theme::Theme, toolbar},
 };
+
+/// Toolbar definition. Order is what the user sees left-to-right.
+const BUTTONS: &[(&str, ChangeAction)] = &[
+    ("✓ commit", ChangeAction::Commit),
+    ("⇡ commit & push", ChangeAction::CommitAndPush),
+    ("✨ generate message", ChangeAction::AiMessage),
+    ("+ stage all", ChangeAction::StageAll),
+    ("− unstage all", ChangeAction::UnstageAll),
+    ("↻ refresh", ChangeAction::Refresh),
+];
 
 pub fn render(app: &mut App, area: Rect, frame: &mut Frame, theme: &Theme) {
     let active = app.active_pane == Pane::Changes;
+    let title = format!(" Changes ({}) ", app.status.files.len());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme.block_border(active))
+        .title(Span::styled(title, theme.title(active)));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Pack toolbar — always shows every button, wrapping to new rows when narrow.
+    let packed = toolbar::pack(BUTTONS, inner);
+    let toolbar_h = toolbar::rows_used(&packed, inner);
+
+    if inner.height < toolbar_h + 1 {
+        // Pane too short — skip toolbar + per-row buttons; render the bare list.
+        app.change_button_rects.clear();
+        app.change_file_button_rects.clear();
+        app.last_rects.changes_list = inner;
+        render_list(app, inner, frame, theme, /* with_buttons */ false);
+        return;
+    }
+
+    let toolbar_area = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: toolbar_h,
+    };
+    let mut remaining = Rect {
+        x: inner.x,
+        y: inner.y + toolbar_h,
+        width: inner.width,
+        height: inner.height - toolbar_h,
+    };
+
+    let bg_style = Style::default().bg(theme.bg).fg(theme.fg_dim);
+    toolbar::render(&packed, button_style, bg_style, toolbar_area, frame);
+    app.change_button_rects = packed.iter().map(|p| (p.action, p.rect)).collect();
+
+    // Inline commit-message section, between the toolbar and the file list,
+    // mirrors VS Code's source-control text box. Only rendered while the
+    // user is actually composing (input_mode == Commit) so it doesn't take
+    // permanent vertical space when not in use.
+    if app.input_mode == InputMode::Commit && remaining.height >= 4 {
+        let commit_h: u16 = 3; // top border + content + bottom border
+        let commit_area = Rect {
+            x: remaining.x,
+            y: remaining.y,
+            width: remaining.width,
+            height: commit_h,
+        };
+        render_commit_box(app, commit_area, frame, theme);
+        remaining = Rect {
+            x: remaining.x,
+            y: remaining.y + commit_h,
+            width: remaining.width,
+            height: remaining.height - commit_h,
+        };
+    }
+
+    app.last_rects.changes_list = remaining;
+    render_list(app, remaining, frame, theme, /* with_buttons */ true);
+    // After the list draws (and applies its highlight to the selected row),
+    // overlay the per-row +/− chips so they keep their own bg color even on
+    // the highlighted row. This is what "make the green chip stay green when
+    // the row is selected" looks like in code.
+    overlay_file_chips(app, frame);
+}
+
+fn render_commit_box(app: &App, area: Rect, frame: &mut Frame, theme: &Theme) {
+    // Background panel (single-line content surrounded by a thin border).
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.accent))
+        .title(Span::styled(
+            if app.input.generating {
+                " ✨ generating commit message — Esc to cancel "
+            } else if app.input.push_after {
+                " commit (then push) — Enter to apply · Esc to cancel "
+            } else {
+                " commit — Enter to apply · Esc to cancel · ^G regenerate "
+            },
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Compose the inline message line with caret.
+    let buf = &app.input.buf;
+    let cursor = app.input.cursor.min(buf.len());
+    let (left, right) = buf.split_at(cursor);
+    let body = if app.input.generating {
+        format!(" {buf}▌ ")
+    } else {
+        format!(" {left}▏{right} ")
+    };
+    let style = Style::default().fg(theme.fg).bg(theme.selection_bg(true));
+
+    // Reserve a 12-col tail for an "✨ regen" hint chip (only when not actively
+    // generating). The visual cue that the message is editable-and-AI-aware.
+    let hint = if app.input.generating {
+        ""
+    } else if buf.is_empty() {
+        "  ^G ✨ ai"
+    } else {
+        ""
+    };
+    let hint_w = hint.width() as u16;
+
+    let body_w = inner.width.saturating_sub(hint_w);
+    let body_area = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: body_w,
+        height: 1,
+    };
+    frame.render_widget(
+        Paragraph::new(Span::styled(body, style)).style(style),
+        body_area,
+    );
+
+    if hint_w > 0 {
+        let hint_area = Rect {
+            x: inner.x + body_w,
+            y: inner.y,
+            width: hint_w,
+            height: 1,
+        };
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                hint,
+                Style::default().fg(theme.fg_dim).bg(theme.selection_bg(false)),
+            )),
+            hint_area,
+        );
+    }
+}
+
+/// Paint the +/− stage-toggle chips on top of the just-rendered list, so the
+/// row highlight from `List::highlight_style` doesn't bleed through their
+/// colored backgrounds.
+fn overlay_file_chips(app: &mut App, frame: &mut Frame) {
+    let files = app.status.files.clone();
+    for (idx, rect) in app.change_file_button_rects.clone() {
+        let Some(f) = files.get(idx) else { continue };
+        let staged = is_fully_staged(f);
+        let glyph = if staged { " − " } else { " + " };
+        let style = if staged {
+            Style::default()
+                .fg(Color::Rgb(0x10, 0x14, 0x18))
+                .bg(Color::Rgb(0xE2, 0xA8, 0xA8))
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .fg(Color::Rgb(0x10, 0x14, 0x18))
+                .bg(Color::Rgb(0xA8, 0xE0, 0xB6))
+                .add_modifier(Modifier::BOLD)
+        };
+        // Force the bg by setting both the Span style AND the Paragraph style;
+        // the latter fills any non-styled cells (defensive for narrow rects).
+        frame.render_widget(
+            Paragraph::new(Span::styled(glyph, style)).style(style),
+            rect,
+        );
+    }
+}
+
+fn button_style(action: ChangeAction) -> Style {
+    let ink = Color::Rgb(0x10, 0x14, 0x18);
+    let bg = match action {
+        ChangeAction::Commit => Color::Rgb(0x9E, 0xCB, 0xFF),       // light blue
+        ChangeAction::CommitAndPush => Color::Rgb(0xC8, 0xA2, 0xE2), // soft purple
+        ChangeAction::AiMessage => Color::Rgb(0xFF, 0xD8, 0x8E),    // peach (sparkles)
+        ChangeAction::StageAll => Color::Rgb(0xA8, 0xE0, 0xB6),     // mint
+        ChangeAction::UnstageAll => Color::Rgb(0xE2, 0xA8, 0xA8),   // pale red
+        ChangeAction::Refresh => Color::Rgb(0xB6, 0xC2, 0xE6),      // periwinkle
+    };
+    Style::default().fg(ink).bg(bg).add_modifier(Modifier::BOLD)
+}
+
+/// Render the file list. When `with_buttons` is set, each row reserves a
+/// trailing zone for the `+`/`−` toggle button (drawn later as an overlay,
+/// not inline, so the row highlight doesn't override the chip color).
+fn render_list(
+    app: &mut App,
+    area: Rect,
+    frame: &mut Frame,
+    theme: &Theme,
+    with_buttons: bool,
+) {
+    let active = app.active_pane == Pane::Changes;
     let files = &app.status.files;
+
+    // Width budget for the chip column: 1-col gap + 3-col chip = 4 cols.
+    const BTN_GAP: u16 = 1;
+    const BTN_W: u16 = 3;
+    const RESERVED: u16 = BTN_GAP + BTN_W;
+    let content_width = area.width.saturating_sub(2) as usize; // -2 for left gutter + scroll padding
+    let row_width_for_text = if with_buttons && !files.is_empty() {
+        content_width.saturating_sub(RESERVED as usize)
+    } else {
+        content_width
+    };
 
     let items: Vec<ListItem<'_>> = if files.is_empty() {
         vec![ListItem::new(Span::styled(
@@ -23,31 +236,43 @@ pub fn render(app: &mut App, area: Rect, frame: &mut Frame, theme: &Theme) {
             Style::default().fg(theme.fg_dim),
         ))]
     } else {
-        let content_width = area.width.saturating_sub(2) as usize;
         files
             .iter()
-            .map(|f| ListItem::new(file_line(f, content_width, theme)))
+            .map(|f| ListItem::new(file_line(f, row_width_for_text, theme)))
             .collect()
     };
 
-    let title = format!(" Changes ({}) ", files.len());
-    let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(theme.block_border(active))
-                .title(Span::styled(title, theme.title(active))),
-        )
-        .highlight_style(
-            Style::default()
-                .bg(theme.selection_bg(active))
-                .add_modifier(Modifier::BOLD),
-        );
-
+    let list = List::new(items).highlight_style(
+        Style::default()
+            .bg(theme.selection_bg(active))
+            .add_modifier(Modifier::BOLD),
+    );
     frame.render_stateful_widget(list, area, &mut app.changes_state);
+
+    // Compute per-row chip rects from the visible window. The List's offset
+    // tells us which file index renders on the first visible row.
+    app.change_file_button_rects.clear();
+    if with_buttons && !files.is_empty() {
+        let offset = app.changes_state.offset();
+        let visible = (area.height as usize).min(files.len().saturating_sub(offset));
+        for i in 0..visible {
+            let idx = offset + i;
+            let rect = Rect {
+                x: area.x + area.width.saturating_sub(BTN_W),
+                y: area.y + i as u16,
+                width: BTN_W,
+                height: 1,
+            };
+            app.change_file_button_rects.push((idx, rect));
+        }
+    }
 }
 
-fn file_line<'a>(f: &'a FileChange, content_width: usize, theme: &Theme) -> Line<'a> {
+fn file_line<'a>(
+    f: &'a FileChange,
+    content_width: usize,
+    theme: &Theme,
+) -> Line<'a> {
     let deleted = matches!(f.kind, ChangeKind::Deleted);
     let (name, parent) = split_path(&f.path);
     let (icon, icon_style) = file_icon(&f.path, theme);
@@ -159,33 +384,33 @@ fn file_icon(path: &str, theme: &Theme) -> (&'static str, Style) {
     let ext = name.rsplit_once('.').map(|(_, ext)| ext).unwrap_or("");
 
     let (icon, color) = match name {
-        "cargo.toml" | "cargo.lock" => ("", Color::Rgb(0xDE, 0xA5, 0x84)),
-        "dockerfile" => ("", Color::Rgb(0x24, 0x96, 0xED)),
-        "makefile" => ("", Color::Rgb(0xB8, 0xB8, 0xB8)),
+        "cargo.toml" | "cargo.lock" => ("", Color::Rgb(0xDE, 0xA5, 0x84)),
+        "dockerfile" => ("", Color::Rgb(0x24, 0x96, 0xED)),
+        "makefile" => ("", Color::Rgb(0xB8, 0xB8, 0xB8)),
         _ => match ext {
-            "rs" => ("", Color::Rgb(0xDE, 0xA5, 0x84)),
-            "ts" => ("", Color::Rgb(0x31, 0x78, 0xC6)),
-            "tsx" => ("", Color::Rgb(0x61, 0xDA, 0xFB)),
-            "js" | "mjs" | "cjs" => ("", Color::Rgb(0xF7, 0xDF, 0x1E)),
-            "jsx" => ("", Color::Rgb(0x61, 0xDA, 0xFB)),
-            "json" => ("", Color::Rgb(0xF7, 0xDF, 0x1E)),
-            "html" | "htm" => ("", Color::Rgb(0xE3, 0x4C, 0x26)),
-            "css" => ("", Color::Rgb(0x56, 0x9C, 0xD6)),
-            "scss" | "sass" => ("", Color::Rgb(0xC6, 0x53, 0x8C)),
-            "md" | "markdown" => ("", Color::Rgb(0x56, 0x9C, 0xD6)),
-            "py" => ("", Color::Rgb(0xFF, 0xD4, 0x3B)),
-            "go" => ("", Color::Rgb(0x00, 0xAD, 0xD8)),
-            "java" => ("", Color::Rgb(0xF8, 0x98, 0x20)),
-            "kt" | "kts" => ("", Color::Rgb(0xB1, 0x25, 0xEA)),
-            "rb" => ("", Color::Rgb(0xCC, 0x34, 0x2D)),
-            "php" => ("", Color::Rgb(0x77, 0x7B, 0xB4)),
-            "sh" | "bash" | "zsh" | "fish" => ("", Color::Rgb(0x89, 0xE0, 0x51)),
-            "yml" | "yaml" | "toml" | "ini" => ("", theme.fg_dim),
-            "c" | "h" => ("", Color::Rgb(0x59, 0x9E, 0xD8)),
-            "cc" | "cpp" | "cxx" | "hpp" | "hh" => ("", Color::Rgb(0x00, 0x59, 0x9C)),
+            "rs" => ("", Color::Rgb(0xDE, 0xA5, 0x84)),
+            "ts" => ("", Color::Rgb(0x31, 0x78, 0xC6)),
+            "tsx" => ("", Color::Rgb(0x61, 0xDA, 0xFB)),
+            "js" | "mjs" | "cjs" => ("", Color::Rgb(0xF7, 0xDF, 0x1E)),
+            "jsx" => ("", Color::Rgb(0x61, 0xDA, 0xFB)),
+            "json" => ("", Color::Rgb(0xF7, 0xDF, 0x1E)),
+            "html" | "htm" => ("", Color::Rgb(0xE3, 0x4C, 0x26)),
+            "css" => ("", Color::Rgb(0x56, 0x9C, 0xD6)),
+            "scss" | "sass" => ("", Color::Rgb(0xC6, 0x53, 0x8C)),
+            "md" | "markdown" => ("", Color::Rgb(0x56, 0x9C, 0xD6)),
+            "py" => ("", Color::Rgb(0xFF, 0xD4, 0x3B)),
+            "go" => ("", Color::Rgb(0x00, 0xAD, 0xD8)),
+            "java" => ("", Color::Rgb(0xF8, 0x98, 0x20)),
+            "kt" | "kts" => ("", Color::Rgb(0xB1, 0x25, 0xEA)),
+            "rb" => ("", Color::Rgb(0xCC, 0x34, 0x2D)),
+            "php" => ("", Color::Rgb(0x77, 0x7B, 0xB4)),
+            "sh" | "bash" | "zsh" | "fish" => ("", Color::Rgb(0x89, 0xE0, 0x51)),
+            "yml" | "yaml" | "toml" | "ini" => ("", theme.fg_dim),
+            "c" | "h" => ("", Color::Rgb(0x59, 0x9E, 0xD8)),
+            "cc" | "cpp" | "cxx" | "hpp" | "hh" => ("", Color::Rgb(0x00, 0x59, 0x9C)),
             "cs" => ("󰌛", Color::Rgb(0x68, 0x2A, 0xD7)),
-            "swift" => ("", Color::Rgb(0xF0, 0x51, 0x38)),
-            _ => ("", theme.fg_dim),
+            "swift" => ("", Color::Rgb(0xF0, 0x51, 0x38)),
+            _ => ("", theme.fg_dim),
         },
     };
 

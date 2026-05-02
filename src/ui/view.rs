@@ -1,6 +1,7 @@
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    text::Span,
+    style::{Modifier, Style},
+    text::{Line, Span},
     widgets::Paragraph,
     Frame,
 };
@@ -22,10 +23,10 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     let theme = theme::current();
     let area = frame.area();
 
+    // The commit-input UI now lives inline inside the Changes pane (so it
+    // sits next to the file list, like VS Code's source-control textbox). We
+    // no longer reserve a strip at the bottom for it.
     let mut constraints = vec![Constraint::Min(1)];
-    if app.input_mode == InputMode::Commit {
-        constraints.push(Constraint::Length(1));
-    }
     constraints.push(Constraint::Length(1)); // status bar
     if app.toast.is_some() {
         constraints.push(Constraint::Length(1));
@@ -39,10 +40,6 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     let mut idx = 0;
     render_main(app, frame, chunks[idx], &theme);
     idx += 1;
-    if app.input_mode == InputMode::Commit {
-        panes::commit_input::render(&app.input, chunks[idx], frame, &theme);
-        idx += 1;
-    }
     render_status_bar(app, frame, chunks[idx], &theme);
     idx += 1;
     if app.toast.is_some() {
@@ -65,6 +62,32 @@ pub fn render(app: &mut App, frame: &mut Frame) {
             panes::model_picker::render(picker, current.as_deref(), area, frame, &theme);
         }
     }
+    if app.settings.is_some() {
+        let current_model = app.config.ollama.model.clone();
+        let base_url = app.config.ollama.base_url.clone();
+        let system_prompt = app.config.ollama.system_prompt.clone();
+        if let Some(state) = app.settings.as_mut() {
+            panes::settings::render(
+                state,
+                current_model.as_deref(),
+                &base_url,
+                &system_prompt,
+                area,
+                frame,
+                &theme,
+            );
+        }
+    }
+    // Info / error popup. Rendered above other modals so the message can't
+    // be hidden by a settings/picker that happened to be open underneath.
+    if let Some(d) = app.info_dialog.clone() {
+        panes::info::render(&d, area, frame, &theme);
+    }
+    // Generation modal renders LAST so it sits on top of every other modal —
+    // it owns the screen exclusively while AI is generating.
+    if let Some(g) = app.generation.clone() {
+        panes::generation::render(&g, area, frame, &theme);
+    }
 }
 
 fn render_main(app: &mut App, frame: &mut Frame, area: Rect, theme: &theme::Theme) {
@@ -72,13 +95,25 @@ fn render_main(app: &mut App, frame: &mut Frame, area: Rect, theme: &theme::Them
     let (left_rect, graph_rect, preview_rect) = compute_columns(area, app, show_preview);
     let (branches_rect, changes_rect) = compute_left_split(left_rect, app);
 
-    // Capture rects for the mouse handler.
+    // Capture rects for the mouse handler. Status-bar rects are filled in
+    // later by `render_status_bar`; we preserve any prior values so they're
+    // not nulled out between draws.
+    let prev_status_ollama = app.last_rects.status_ollama;
+    let prev_status_settings = app.last_rects.status_settings;
+    // List rects start empty each frame; each pane fills its own when it
+    // renders below. Defaulting to the pane rect keeps fall-through behavior
+    // sane if a pane skips rendering for any reason.
     app.last_rects = PaneRects {
         main_area: area,
         branches: branches_rect,
         changes: changes_rect,
         graph: graph_rect,
         preview: preview_rect,
+        status_ollama: prev_status_ollama,
+        status_settings: prev_status_settings,
+        branches_list: branches_rect,
+        changes_list: changes_rect,
+        graph_list: graph_rect,
     };
 
     panes::branches::render(app, branches_rect, frame, theme);
@@ -180,7 +215,7 @@ fn compute_left_split(left: Rect, app: &App) -> (Rect, Rect) {
     (branches, changes)
 }
 
-fn render_status_bar(app: &App, frame: &mut Frame, area: Rect, theme: &theme::Theme) {
+fn render_status_bar(app: &mut App, frame: &mut Frame, area: Rect, theme: &theme::Theme) {
     let head_label = match &app.head {
         HeadRef::Branch(b) => b.clone(),
         HeadRef::Detached(sha) => format!("detached@{sha}"),
@@ -216,11 +251,53 @@ fn render_status_bar(app: &App, frame: &mut Frame, area: Rect, theme: &theme::Th
         OllamaAvailability::Unknown => "ollama: …".to_string(),
     };
     let hints = pane_hints(app);
-    let text = format!(
-        " gsc · {head_label}{track_label} · {} changes · {gh_label} · {ollama_label} · {pane_label}{mode_label} · {hints} · ? help · q quit ",
+
+    // We render the bar as a sequence of spans so we can hit-test specific
+    // segments (the ollama chip and the settings chip) on click. Each span's
+    // x range is tracked as we go so the click handler knows where they live.
+    let base = theme.status_bar();
+    // Clickable segments use a slightly punchier underline + bold so they
+    // read as actionable to a user who's mousing over.
+    let clickable = base.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+
+    let prefix = format!(
+        " gsc · {head_label}{track_label} · {} changes · {gh_label} · ",
         app.status.files.len(),
     );
-    let bar = Paragraph::new(Span::raw(text)).style(theme.status_bar());
+    let mid = format!(" · {pane_label}{mode_label} · {hints} · ");
+    let settings_chip = "⚙ settings";
+    let tail = " · ? help · q quit ";
+
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(8);
+    let mut cursor_x = area.x;
+    let push_seg = |spans: &mut Vec<Span<'static>>,
+                    cursor_x: &mut u16,
+                    text: String,
+                    style: Style|
+     -> Rect {
+        let w = text.chars().count() as u16;
+        let r = Rect {
+            x: *cursor_x,
+            y: area.y,
+            width: w.min(area.width.saturating_sub((*cursor_x).saturating_sub(area.x))),
+            height: 1,
+        };
+        spans.push(Span::styled(text, style));
+        *cursor_x = (*cursor_x).saturating_add(w);
+        r
+    };
+
+    let _ = push_seg(&mut spans, &mut cursor_x, prefix, base);
+    let ollama_rect = push_seg(&mut spans, &mut cursor_x, ollama_label, clickable);
+    let _ = push_seg(&mut spans, &mut cursor_x, mid, base);
+    let settings_rect = push_seg(&mut spans, &mut cursor_x, settings_chip.to_string(), clickable);
+    let _ = push_seg(&mut spans, &mut cursor_x, tail.to_string(), base);
+
+    // Persist the rects so the click handler can hit-test them.
+    app.last_rects.status_ollama = Some(ollama_rect);
+    app.last_rects.status_settings = Some(settings_rect);
+
+    let bar = Paragraph::new(Line::from(spans)).style(base);
     frame.render_widget(bar, area);
 }
 
@@ -235,7 +312,7 @@ fn pane_hints(app: &App) -> &'static str {
     }
     match app.active_pane {
         Pane::Branches => "↑↓ graph preview · Enter checkout · n new · p push · P pull · m merge · d del",
-        Pane::Changes => "Space stage · a all · c commit · ^G ai-commit · M model · x discard",
+        Pane::Changes => "Space stage · a all · c commit · ^G generate message · M model · , settings · x discard",
         Pane::Graph => "↑↓ live preview · Enter full · o github",
     }
 }

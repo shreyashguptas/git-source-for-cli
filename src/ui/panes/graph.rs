@@ -2,7 +2,7 @@ use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem},
+    widgets::{Block, Borders, Paragraph},
     Frame,
 };
 
@@ -14,52 +14,105 @@ use crate::{
 
 pub fn render(app: &mut App, area: Rect, frame: &mut Frame, theme: &Theme) {
     let active = app.active_pane == Pane::Graph;
-
-    // Build title + items first so the immutable borrow of `app` ends before
-    // we render the stateful widget (which needs a mutable borrow of
-    // `app.graph_state`).
     let title = build_title(app);
-    let items: Vec<ListItem<'_>> = if app.commits.is_empty() {
-        vec![ListItem::new(Span::styled(
+
+    // Render the bordered block; everything below paints inside `inner`.
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme.block_border(active))
+        .title(Span::styled(title, theme.title(active)));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    app.last_rects.graph_list = inner;
+
+    if app.commits.is_empty() {
+        let placeholder = Paragraph::new(Span::styled(
             " (loading history…)",
             Style::default().fg(theme.fg_dim),
-        ))]
-    } else {
-        let rows = graph::layout(&app.commits);
-        let commits = &app.commits;
-        let ahead = &app.ahead_shas;
-        let behind = &app.behind_shas;
-        rows.iter()
-            .map(|row| {
-                let commit = &commits[row.commit_idx];
-                let is_head = commit.refs.iter().any(|r| {
-                    matches!(
-                        r,
-                        crate::git::RefName::HeadAt(_) | crate::git::RefName::Head
-                    )
-                });
-                let mut spans = graph::row_spans(row, commit, theme, is_head);
-                if let Some(m) = divergence_marker_static(&commit.hash, ahead, behind, theme) {
-                    spans.insert(0, m);
-                }
-                ListItem::new(Line::from(spans))
-            })
-            .collect()
-    };
-    let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(theme.block_border(active))
-                .title(Span::styled(title, theme.title(active))),
-        )
-        .highlight_style(
-            Style::default()
-                .bg(theme.selection_bg(active))
-                .add_modifier(Modifier::BOLD),
-        );
+        ));
+        frame.render_widget(placeholder, inner);
+        return;
+    }
 
-    frame.render_stateful_widget(list, area, &mut app.graph_state);
+    // Lane layout is O(N) over commits; cache it across frames so scrolling
+    // doesn't recompute on every keystroke. Invalidated when commits reload
+    // (see `App::graph_layout = None` in app.rs).
+    if app.graph_layout.is_none() {
+        app.graph_layout = Some(graph::layout(&app.commits));
+    }
+
+    // Body width available to `row_spans` after subtracting the 2-cell
+    // divergence marker prepended below. (Borders are already excluded by
+    // `block.inner`.)
+    const MARKER_WIDTH: usize = 2;
+    let body_width = (inner.width as usize).saturating_sub(MARKER_WIDTH);
+
+    let viewport = inner.height as usize;
+    let total = app.commits.len();
+    if viewport == 0 || total == 0 {
+        return;
+    }
+
+    let selected = app
+        .graph_state
+        .selected()
+        .unwrap_or(0)
+        .min(total.saturating_sub(1));
+
+    // Manage scroll offset ourselves: we don't pass items to `List`, so
+    // ratatui's auto-scroll doesn't apply. Mirror its behavior — keep
+    // `selected` inside [offset, offset+viewport).
+    {
+        let offset = app.graph_state.offset_mut();
+        if *offset > selected {
+            *offset = selected;
+        }
+        if selected >= *offset + viewport {
+            *offset = selected + 1 - viewport;
+        }
+        // Avoid leaving blank rows at the bottom when total < offset+viewport
+        // would scroll past the last row.
+        let max_offset = total.saturating_sub(viewport);
+        if *offset > max_offset {
+            *offset = max_offset;
+        }
+    }
+    let offset = app.graph_state.offset();
+    let end = (offset + viewport).min(total);
+
+    let rows = app.graph_layout.as_ref().expect("just populated");
+    let max_lanes = rows.iter().map(graph::lane_count).max().unwrap_or(1);
+    let commits = &app.commits;
+    let ahead = &app.ahead_shas;
+    let behind = &app.behind_shas;
+
+    // Construct spans ONLY for the visible window — this is what makes the
+    // pane scale to thousands of commits without per-frame O(N) span work.
+    let highlight = Style::default()
+        .bg(theme.selection_bg(active))
+        .add_modifier(Modifier::BOLD);
+    let mut lines: Vec<Line<'_>> = Vec::with_capacity(end - offset);
+    for i in offset..end {
+        let row = &rows[i];
+        let commit = &commits[row.commit_idx];
+        let is_head = commit.refs.iter().any(|r| {
+            matches!(
+                r,
+                crate::git::RefName::HeadAt(_) | crate::git::RefName::Head
+            )
+        });
+        let mut spans = graph::row_spans(row, commit, theme, is_head, max_lanes, body_width);
+        if let Some(m) = divergence_marker_static(&commit.hash, ahead, behind, theme) {
+            spans.insert(0, m);
+        }
+        let mut line = Line::from(spans);
+        if i == selected {
+            line = line.style(highlight);
+        }
+        lines.push(line);
+    }
+
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// Build the graph title with the VS Code-style divergence summary:
@@ -71,6 +124,12 @@ fn build_title(app: &App) -> String {
     let total = app.commits.len();
     let ahead = app.ahead_shas.len();
     let behind = app.behind_shas.len();
+    // `5000+` when we hit the load cap — disclose that there's more history.
+    let count = if app.graph_truncated {
+        format!("{total}+ commits")
+    } else {
+        format!("{total} commits")
+    };
 
     match (branch.as_deref(), upstream) {
         (Some(b), Some(up)) => {
@@ -88,10 +147,10 @@ fn build_title(app: &App) -> String {
                     sync_part.push_str(&format!("↓{behind} to pull"));
                 }
             }
-            format!(" Graph · {b} ↔ {up} · {sync_part} · {total} commits ")
+            format!(" Graph · {b} ↔ {up} · {sync_part} · {count} ")
         }
-        (Some(b), None) => format!(" Graph · {b} (no upstream) · {total} commits "),
-        (None, _) => format!(" Graph · {total} commits "),
+        (Some(b), None) => format!(" Graph · {b} (no upstream) · {count} "),
+        (None, _) => format!(" Graph · {count} "),
     }
 }
 

@@ -50,6 +50,10 @@ pub enum AppEvent {
     PreviewLoaded(String, DetailsContent),
     /// A background load failed — message is the user-facing one-liner.
     LoadFailed(String),
+    /// A user-initiated git op (push, delete, merge, …) failed. Routed to a
+    /// modal popup so the error can't be missed; `label` is what the user
+    /// asked for (e.g. "delete branch foo"), `error` is git's stderr.
+    OpFailed { label: String, error: String },
 
     /// Probe of the local Ollama instance — null when unreachable, otherwise
     /// includes the list of installed models.

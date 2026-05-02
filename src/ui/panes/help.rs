@@ -63,7 +63,8 @@ fn build_lines(theme: &Theme) -> Vec<Line<'static>> {
         row("r", "force refresh"),
         row("j  k  ↑↓", "move selection"),
         row("g  G", "top / bottom"),
-        row("PgUp PgDn", "jump 10 rows"),
+        row("PgUp PgDn", "jump one page (viewport height)"),
+        row("Ctrl-U  Ctrl-D", "jump half a page"),
         row("Enter", "context action (see below)"),
         Line::from(""),
         head("Mouse"),
@@ -128,8 +129,9 @@ fn build_lines(theme: &Theme) -> Vec<Line<'static>> {
         Line::from(""),
         head("Ollama (local AI commit messages)"),
         row("Ctrl-G", "stage some files, then press Ctrl-G — Ollama writes the subject"),
-        row("M", "open model picker (lists installed models; saves choice to ~/.config/gsc)"),
-        row("status bar", "shows ollama: ✓ <model> when reachable; ✗ when not running"),
+        row(",", "open settings (model + base URL + system prompt)"),
+        row("M", "open model picker directly — type to filter, ↑↓ + Enter pick"),
+        row("status bar", "click `ollama: ✓ <model>` to switch model; click `⚙ settings` to open settings"),
         row("config", "~/.config/gsc/config.json (base_url, model, system_prompt)"),
     ]
 }

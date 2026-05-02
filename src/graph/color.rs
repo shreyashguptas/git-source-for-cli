@@ -37,11 +37,13 @@ pub const PILL_PALETTE: [Color; 8] = [
 ];
 
 /// Dedicated colours so HEAD / cloud / tag are instantly recognisable —
-/// they do NOT come from the per-branch hashed palette.
-pub const HEAD_PILL_BG: Color = Color::Rgb(0x6F, 0xE2, 0x8E); // bright green for current HEAD
-pub const HEAD_PILL_FG: Color = Color::Rgb(0x0A, 0x1A, 0x10);
-pub const CLOUD_CHIP_BG: Color = Color::Rgb(0x9C, 0xDC, 0xFE); // sky blue cloud chip
-pub const CLOUD_CHIP_FG: Color = Color::Rgb(0x0A, 0x16, 0x22);
+/// they do NOT come from the per-branch hashed palette. HEAD specifically
+/// uses a saturated emerald background so the current branch reads clearly
+/// regardless of whether its row is selected.
+pub const HEAD_PILL_BG: Color = Color::Rgb(0x22, 0xC5, 0x5E); // saturated emerald for current HEAD
+pub const HEAD_PILL_FG: Color = Color::Rgb(0x05, 0x1B, 0x0E);
+pub const CLOUD_CHIP_BG: Color = Color::Rgb(0x60, 0xA5, 0xFA); // sky blue cloud chip
+pub const CLOUD_CHIP_FG: Color = Color::Rgb(0x05, 0x12, 0x1F);
 pub const REMOTE_ONLY_BG: Color = Color::Rgb(0x6E, 0x84, 0x99); // muted slate for remote-only
 pub const REMOTE_ONLY_FG: Color = Color::Rgb(0xF8, 0xFA, 0xFC);
 pub const TAG_PILL_BG: Color = Color::Rgb(0xFF, 0xD7, 0x6E); // bright gold for tags

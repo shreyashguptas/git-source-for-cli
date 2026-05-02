@@ -17,6 +17,7 @@ use crate::{
     event::{spawn_event_loop, AppEvent},
     gh::{self, Availability, Pr},
     git::{self, Branch, ChangeKind, Commit, HeadRef, Repo, Status},
+    graph,
     ollama::{self, Availability as OllamaAvailability},
     ui::{
         self,
@@ -24,13 +25,22 @@ use crate::{
             commit_input::InputState,
             confirm::{ConfirmAction, ConfirmDialog},
             details::DetailsContent,
+            generation::{GenerationDialog, GenerationPhase},
+            info::InfoDialog,
             model_picker::ModelPickerState,
+            settings::{FieldEditor, SettingsRow, SettingsState},
         },
     },
 };
 
 type BoxedFetch = Pin<Box<dyn Future<Output = Result<String>> + Send>>;
 type BoxedOp = Pin<Box<dyn Future<Output = Result<String>> + Send>>;
+
+/// Hard cap on commits loaded into the Graph pane. Bounded so the worst-case
+/// (200k-commit monorepo) doesn't OOM, but high enough to scroll real history.
+/// When this limit is hit, `App::graph_truncated` is set and the title shows
+/// `5000+` instead of an exact count.
+pub const MAX_GRAPH_COMMITS: usize = 5000;
 
 /// Which pane currently has focus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +86,20 @@ pub struct PaneRects {
     pub changes: Rect,
     pub graph: Rect,
     pub preview: Option<Rect>,
+    /// Just the row area each pane's `List` widget occupies — i.e. the pane's
+    /// inner rect minus the toolbar (and the inline commit-message box, when
+    /// open in Changes). Click hit-testing uses this so a click maps to the
+    /// row directly under the cursor regardless of how tall the toolbar
+    /// wrapped to or whether the commit box is visible.
+    pub branches_list: Rect,
+    pub changes_list: Rect,
+    pub graph_list: Rect,
+    /// On-screen rect of the `ollama: ✓ <model>` segment in the status bar.
+    /// Click here = open model picker. Empty when not rendered.
+    pub status_ollama: Option<Rect>,
+    /// On-screen rect of the `[ ⚙ settings ]` chip in the status bar.
+    /// Click here = open settings modal.
+    pub status_settings: Option<Rect>,
 }
 
 /// User-driven width/height overrides for the layout. Stored in absolute
@@ -117,6 +141,18 @@ pub enum BranchAction {
     Delete,
 }
 
+/// Actions exposed as clickable buttons in the Changes pane toolbar.
+/// Same dispatch as the keyboard shortcuts (`c` / `C` / `^G` / `a` / `A` / `r`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeAction {
+    Commit,
+    CommitAndPush,
+    AiMessage,
+    StageAll,
+    UnstageAll,
+    Refresh,
+}
+
 /// Top-level application state.
 pub struct App {
     pub repo: Repo,
@@ -125,6 +161,13 @@ pub struct App {
     pub head: HeadRef,
     pub branches: Vec<Branch>,
     pub commits: Vec<Commit>,
+    /// True when `commits` was capped at `MAX_GRAPH_COMMITS` — i.e. there's
+    /// older history we didn't load. Used to disclose `5000+` in the title.
+    pub graph_truncated: bool,
+    /// Cached lane layout for `commits`. Recomputed only when commits change
+    /// (see invalidations at `CommitsLoaded` and `sync_graph_source_to_branch_selection`).
+    /// Avoids paying O(N) lane allocation on every render frame.
+    pub graph_layout: Option<Vec<graph::Row>>,
     /// Branch whose history is currently shown in the Graph pane. Selection in
     /// Branches changes this source without checking anything out.
     pub graph_branch: Option<String>,
@@ -182,6 +225,15 @@ pub struct App {
     pub ollama: OllamaAvailability,
     /// Active model-picker modal, if open.
     pub model_picker: Option<ModelPickerState>,
+    /// Active settings modal, if open.
+    pub settings: Option<SettingsState>,
+    /// Active commit-message generation modal — present while streaming, when
+    /// the result is ready for review, and when an error needs to be shown.
+    pub generation: Option<GenerationDialog>,
+    /// Active info / error popup. Used for any message the user shouldn't
+    /// risk missing (op failures, blocked deletes, etc.) — replaces the
+    /// bottom toast for diagnostic-grade output.
+    pub info_dialog: Option<InfoDialog>,
     /// Handle to the in-flight generation task — kept so Esc can abort it.
     pub gen_task: Option<tokio::task::JoinHandle<()>>,
 
@@ -194,6 +246,11 @@ pub struct App {
     /// render. Click handler hit-tests these to dispatch the corresponding
     /// `BranchAction`.
     pub branch_button_rects: Vec<(BranchAction, Rect)>,
+    /// Same idea for the Changes-pane toolbar.
+    pub change_button_rects: Vec<(ChangeAction, Rect)>,
+    /// Per-row `+`/`−` toggle buttons in the Changes pane: tuple is
+    /// `(file_index_in_status, rect)`. Empty when toolbar didn't render.
+    pub change_file_button_rects: Vec<(usize, Rect)>,
 }
 
 impl App {
@@ -211,6 +268,8 @@ impl App {
             head,
             branches: Vec::new(),
             commits: Vec::new(),
+            graph_truncated: false,
+            graph_layout: None,
             graph_branch,
             graph_upstream: None,
             graph_root,
@@ -243,10 +302,15 @@ impl App {
             config,
             ollama: OllamaAvailability::Unknown,
             model_picker: None,
+            settings: None,
+            generation: None,
+            info_dialog: None,
             gen_task: None,
             layout_overrides: LayoutOverrides::default(),
             active_drag: ResizeDrag::None,
             branch_button_rects: Vec::new(),
+            change_button_rects: Vec::new(),
+            change_file_button_rects: Vec::new(),
         };
         s.branches_state.select(Some(0));
         s.changes_state.select(Some(0));
@@ -277,7 +341,7 @@ impl App {
             AppEvent::Quit => self.should_quit = true,
             AppEvent::Resize(w, h) => self.size = (w, h),
             AppEvent::Key(key) => self.handle_key(key).await,
-            AppEvent::Mouse(m) => self.handle_mouse(m),
+            AppEvent::Mouse(m) => self.handle_mouse(m).await,
             AppEvent::Tick => {
                 self.spawn_refresh();
             }
@@ -295,7 +359,9 @@ impl App {
             } => {
                 if request_id == self.graph_request_id {
                     clamp_selection(&mut self.graph_state, commits.len());
+                    self.graph_truncated = commits.len() >= MAX_GRAPH_COMMITS;
                     self.commits = commits;
+                    self.graph_layout = None;
                     self.update_preview();
                 }
             }
@@ -346,6 +412,15 @@ impl App {
             AppEvent::LoadFailed(msg) => {
                 self.toast = Some(msg);
             }
+            AppEvent::OpFailed { label, error } => {
+                let title = format!("{label} failed");
+                let hint = suggest_op_hint(&label, &error);
+                let mut dialog = InfoDialog::error(title, error);
+                if let Some(h) = hint {
+                    dialog = dialog.with_hint(h);
+                }
+                self.info_dialog = Some(dialog);
+            }
             AppEvent::OllamaAvailability(a) => {
                 self.ollama = a;
                 // If the user's saved model isn't available, fall back to the
@@ -365,27 +440,67 @@ impl App {
                         }
                     }
                 }
+                // Live-refresh the picker if it's open. Whatever the new
+                // availability is, we hand the fresh list (or empty) to the
+                // picker so the user sees the up-to-date state without
+                // closing/reopening.
+                if let Some(picker) = self.model_picker.as_mut() {
+                    let fresh: Vec<String> = match &self.ollama {
+                        OllamaAvailability::Ready { models } => models.clone(),
+                        _ => Vec::new(),
+                    };
+                    let current = self.config.ollama.model.as_deref();
+                    picker.replace_models(fresh, current);
+                }
             }
             AppEvent::OllamaToken(tok) => {
+                // Route into both the modal preview and the inline buf — the
+                // inline buf is what gets committed on accept, the modal is
+                // what the user reads while it streams.
+                if let Some(g) = self.generation.as_mut() {
+                    g.append_partial(&tok);
+                }
                 if self.input.generating {
                     self.input.append(&tok);
                 }
             }
             AppEvent::OllamaDone(full) => {
+                let cleaned = clean_subject(&full);
                 if self.input.generating {
                     self.input.generating = false;
-                    self.input.buf = clean_subject(&full);
+                    self.input.buf = cleaned.clone();
                     self.input.cursor = self.input.buf.len();
+                }
+                if let Some(g) = self.generation.as_mut() {
+                    g.finish_done(cleaned);
                 }
                 self.gen_task = None;
             }
             AppEvent::OllamaError(msg) => {
+                // Surface the error in the generation modal (so it's loud,
+                // not a silent toast). Keep the inline input cleared so the
+                // user doesn't accidentally commit a half-streamed message.
                 if self.input.generating || self.input_mode == InputMode::Commit {
                     self.input.clear();
                     self.input_mode = InputMode::Normal;
                 }
-                self.toast = Some(msg);
+                if let Some(g) = self.generation.as_mut() {
+                    g.finish_error(msg.clone());
+                } else {
+                    // Fallback: no modal up (shouldn't happen post-refactor),
+                    // toast as a last resort so the user still sees it.
+                    self.toast = Some(msg);
+                }
                 self.gen_task = None;
+            }
+        }
+
+        // Spinner animation: any event that fires while a generation modal is
+        // streaming bumps the frame so the UI feels alive even if tokens are
+        // sparse. Cheap modular increment.
+        if let Some(g) = self.generation.as_mut() {
+            if g.is_streaming() {
+                g.spinner = g.spinner.wrapping_add(1);
             }
         }
     }
@@ -394,6 +509,26 @@ impl App {
         // global Ctrl-C quits unconditionally
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.should_quit = true;
+            return;
+        }
+
+        // Generation modal owns the screen above ALL other modals when active.
+        // While streaming, only Esc cancels; once Done/Error, the user reviews.
+        if self.generation.is_some() {
+            self.handle_generation_key(key).await;
+            return;
+        }
+
+        // Info / error popup is dismiss-only — Esc or Enter closes it.
+        // Anything else is ignored so a stray keystroke doesn't trigger a
+        // hidden action behind the popup.
+        if self.info_dialog.is_some() {
+            match key.code {
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
+                    self.info_dialog = None;
+                }
+                _ => {}
+            }
             return;
         }
 
@@ -408,6 +543,7 @@ impl App {
             if self.show_help
                 || self.confirm.is_some()
                 || self.model_picker.is_some()
+                || self.settings.is_some()
                 || self.overlay.is_some()
             {
                 return;
@@ -416,6 +552,12 @@ impl App {
                 return;
             }
             self.start_generation().await;
+            return;
+        }
+
+        // Settings modal has top-level priority once open.
+        if self.settings.is_some() {
+            self.handle_settings_key(key);
             return;
         }
 
@@ -520,8 +662,26 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
             KeyCode::Char('g') | KeyCode::Home => self.move_selection_to(0),
             KeyCode::Char('G') | KeyCode::End => self.move_selection_to(isize::MAX),
-            KeyCode::PageDown => self.move_selection(10),
-            KeyCode::PageUp => self.move_selection(-10),
+            KeyCode::PageDown => {
+                let step = self.active_viewport_height().max(1);
+                self.move_selection(step as isize);
+            }
+            KeyCode::PageUp => {
+                let step = self.active_viewport_height().max(1);
+                self.move_selection(-(step as isize));
+            }
+            KeyCode::Char('d') | KeyCode::Char('D')
+                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                let step = (self.active_viewport_height() / 2).max(1);
+                self.move_selection(step as isize);
+            }
+            KeyCode::Char('u') | KeyCode::Char('U')
+                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                let step = (self.active_viewport_height() / 2).max(1);
+                self.move_selection(-(step as isize));
+            }
             KeyCode::Enter => self.handle_enter().await,
 
             // Pane-specific write ops
@@ -595,6 +755,9 @@ impl App {
             // Open the Ollama model picker. Only opens when ollama is reachable
             // and has at least one model available.
             KeyCode::Char('M') => self.open_model_picker(),
+            // Open the Settings modal — ',' is a common "preferences" mnemonic
+            // (Cmd-, on macOS apps).
+            KeyCode::Char(',') => self.open_settings(),
             _ => {}
         }
     }
@@ -656,8 +819,24 @@ impl App {
 
     /// Mouse handling: left-click focuses + selects, scroll wheel scrolls,
     /// drag on a pane border resizes the layout.
-    fn handle_mouse(&mut self, ev: MouseEvent) {
+    async fn handle_mouse(&mut self, ev: MouseEvent) {
         let pos = (ev.column, ev.row);
+
+        // Generation modal blocks ALL mouse input — the user can't accidentally
+        // navigate while the AI is busy. They have to use the keyboard
+        // (Esc / Enter / r) to advance.
+        if self.generation.is_some() {
+            return;
+        }
+
+        // Info / error popup also blocks mouse: clicking anywhere just
+        // dismisses the popup so the user can keep working.
+        if self.info_dialog.is_some() {
+            if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
+                self.info_dialog = None;
+            }
+            return;
+        }
 
         // Modal overlays own the scroll wheel.
         let overlay_active = self.show_help || self.confirm.is_some();
@@ -673,13 +852,27 @@ impl App {
             return;
         }
 
+        // Settings + model-picker modals consume left-clicks themselves so
+        // rows / list items become clickable. Other events (scroll, drag) are
+        // ignored while a modal owns the screen.
+        if self.settings.is_some() {
+            if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
+                self.handle_settings_click(pos);
+            }
+            return;
+        }
+        if self.model_picker.is_some() {
+            // Picker doesn't expose row rects yet; ignore clicks.
+            return;
+        }
+
         // Don't redirect mouse while typing a commit message.
         if self.input_mode == InputMode::Commit {
             return;
         }
 
         match ev.kind {
-            MouseEventKind::Down(MouseButton::Left) => self.handle_mouse_click(pos),
+            MouseEventKind::Down(MouseButton::Left) => self.handle_mouse_click(pos).await,
             MouseEventKind::Drag(MouseButton::Left) => self.handle_mouse_drag(pos),
             MouseEventKind::Up(MouseButton::Left) => {
                 self.active_drag = ResizeDrag::None;
@@ -690,33 +883,64 @@ impl App {
         }
     }
 
-    fn handle_mouse_click(&mut self, (x, y): (u16, u16)) {
-        // First: did they grab a splitter? If so, start a drag and don't also
+    async fn handle_mouse_click(&mut self, (x, y): (u16, u16)) {
+        // First: status-bar chips. They sit on the bottom row, outside any
+        // pane, so we hit-test them before splitters / pane content.
+        if let Some(rect) = self.last_rects.status_ollama {
+            if hit(rect, x, y) {
+                self.open_model_picker();
+                return;
+            }
+        }
+        if let Some(rect) = self.last_rects.status_settings {
+            if hit(rect, x, y) {
+                self.open_settings();
+                return;
+            }
+        }
+
+        // Second: did they grab a splitter? If so, start a drag and don't also
         // select an item.
         if let Some(drag) = self.detect_splitter(x, y) {
             self.active_drag = drag;
             return;
         }
 
-        // Second: did they click a Branches-pane toolbar button?
+        // Third: did they click a Branches-pane toolbar button?
         if let Some(action) = self.detect_branch_button(x, y) {
             self.run_branch_action(action);
+            return;
+        }
+
+        // Changes-pane toolbar buttons.
+        if let Some(action) = self.detect_change_button(x, y) {
+            self.active_pane = Pane::Changes;
+            self.run_change_action(action).await;
+            return;
+        }
+
+        // Per-row +/− stage toggle buttons in the Changes pane.
+        if let Some(idx) = self.detect_change_file_button(x, y) {
+            self.active_pane = Pane::Changes;
+            self.changes_state.select(Some(idx));
+            self.update_preview();
+            self.toggle_stage_at(idx).await;
             return;
         }
 
         let rects = self.last_rects.clone();
         if hit(rects.branches, x, y) {
             self.active_pane = Pane::Branches;
-            self.click_select_in_pane(rects.branches, y, Pane::Branches);
+            self.click_select_in_pane(rects.branches_list, y, Pane::Branches);
             self.refresh_graph_for_selected_branch();
             self.update_preview();
         } else if hit(rects.changes, x, y) {
             self.active_pane = Pane::Changes;
-            self.click_select_in_pane(rects.changes, y, Pane::Changes);
+            self.click_select_in_pane(rects.changes_list, y, Pane::Changes);
             self.update_preview();
         } else if hit(rects.graph, x, y) {
             self.active_pane = Pane::Graph;
-            self.click_select_in_pane(rects.graph, y, Pane::Graph);
+            self.click_select_in_pane(rects.graph_list, y, Pane::Graph);
             self.update_preview();
         } else if let Some(p) = rects.preview {
             if hit(p, x, y) {
@@ -730,6 +954,20 @@ impl App {
             .iter()
             .find(|(_, r)| hit(*r, x, y))
             .map(|(a, _)| *a)
+    }
+
+    fn detect_change_button(&self, x: u16, y: u16) -> Option<ChangeAction> {
+        self.change_button_rects
+            .iter()
+            .find(|(_, r)| hit(*r, x, y))
+            .map(|(a, _)| *a)
+    }
+
+    fn detect_change_file_button(&self, x: u16, y: u16) -> Option<usize> {
+        self.change_file_button_rects
+            .iter()
+            .find(|(_, r)| hit(*r, x, y))
+            .map(|(idx, _)| *idx)
     }
 
     /// Did the click land exactly on a splitter (the actual border line)?
@@ -814,18 +1052,20 @@ impl App {
         }
     }
 
-    fn click_select_in_pane(&mut self, rect: Rect, y: u16, pane: Pane) {
-        // Inside a bordered Block, the first content row is at rect.y + 1.
-        if y < rect.y + 1 || y >= rect.y + rect.height.saturating_sub(1) {
-            return; // border row
+    /// `list_rect` is the exact area the pane's `List` widget paints into
+    /// (after subtracting borders, toolbar, and the inline commit box). A click
+    /// inside that rect maps directly to a row — no row-offset guessing.
+    fn click_select_in_pane(&mut self, list_rect: Rect, y: u16, pane: Pane) {
+        if list_rect.height == 0 || y < list_rect.y || y >= list_rect.y + list_rect.height {
+            return;
         }
-        let row_in_pane = (y - rect.y - 1) as usize;
+        let row_in_list = (y - list_rect.y) as usize;
         let (state, len) = match pane {
             Pane::Branches => (&mut self.branches_state, self.branches.len()),
             Pane::Changes => (&mut self.changes_state, self.status.files.len()),
             Pane::Graph => (&mut self.graph_state, self.commits.len()),
         };
-        let target = state.offset() + row_in_pane;
+        let target = state.offset() + row_in_list;
         if target < len {
             state.select(Some(target));
         }
@@ -955,15 +1195,19 @@ impl App {
     }
 
     async fn toggle_stage_selected(&mut self) {
-        let Some(idx) = self.changes_state.selected() else {
-            return;
-        };
+        if let Some(idx) = self.changes_state.selected() {
+            self.toggle_stage_at(idx).await;
+        }
+    }
+
+    /// Toggle stage state for `idx` regardless of current selection. Used by
+    /// the per-row `+`/`−` button click in the Changes pane.
+    pub async fn toggle_stage_at(&mut self, idx: usize) {
         let Some(file) = self.status.files.get(idx) else {
             return;
         };
         let path = file.path.clone();
-        let staged_already =
-            file.staged.is_some() && !matches!(file.kind, ChangeKind::Untracked | ChangeKind::Ignored);
+        let staged_already = is_fully_staged(file);
         let label = if staged_already {
             format!("unstage {path}")
         } else {
@@ -976,6 +1220,45 @@ impl App {
             Box::pin(async move { git::ops::stage(&root, &path).await })
         };
         self.run_op_async(&label, op);
+    }
+
+    /// Dispatch a clicked Changes-pane toolbar button. Same effect as the
+    /// keyboard shortcuts that already exist.
+    pub async fn run_change_action(&mut self, action: ChangeAction) {
+        match action {
+            ChangeAction::StageAll => self.run_op_async(
+                "stage all",
+                Box::pin({
+                    let r = self.repo.root.clone();
+                    async move { git::ops::stage_all(&r).await }
+                }),
+            ),
+            ChangeAction::UnstageAll => self.run_op_async(
+                "unstage all",
+                Box::pin({
+                    let r = self.repo.root.clone();
+                    async move { git::ops::unstage_all(&r).await }
+                }),
+            ),
+            ChangeAction::Commit => {
+                self.input_mode = InputMode::Commit;
+                self.input.clear();
+            }
+            ChangeAction::CommitAndPush => {
+                self.input_mode = InputMode::Commit;
+                self.input.clear();
+                self.input.push_after = true;
+            }
+            ChangeAction::AiMessage => {
+                // Drop into commit-input mode (so the streamed message has
+                // somewhere to go) and kick off generation. Same effect the
+                // user would get from `c` followed by `Ctrl-G`.
+                if !self.input.generating {
+                    self.start_generation().await;
+                }
+            }
+            ChangeAction::Refresh => self.spawn_refresh(),
+        }
     }
 
     /// Push current branch — if no upstream, push -u.
@@ -1011,7 +1294,37 @@ impl App {
             return;
         };
         if b.is_current {
-            self.toast = Some("cannot delete current branch — checkout another first".to_string());
+            self.info_dialog = Some(
+                InfoDialog::error(
+                    "Cannot delete current branch",
+                    format!(
+                        "'{}' is checked out in this worktree. Switch to another branch first \
+                         (Branches pane → Enter on the target), then retry the delete.",
+                        b.name
+                    ),
+                ),
+            );
+            return;
+        }
+        // Pre-flight: branches that are checked out in *another* worktree
+        // can't be deleted by git either — surface the reason loudly so the
+        // user knows what to do (remove the worktree first).
+        if let Some(wt_path) = self.worktrees.get(&b.name).cloned() {
+            self.info_dialog = Some(
+                InfoDialog::error(
+                    "Cannot delete worktree branch",
+                    format!(
+                        "'{}' is checked out at the worktree:\n  {}\n\nGit refuses to delete a \
+                         branch that's checked out anywhere — including another worktree.",
+                        b.name,
+                        wt_path.display()
+                    ),
+                )
+                .with_hint(format!(
+                    "Remove the worktree first with `git worktree remove \"{}\"`, then retry the delete here.",
+                    wt_path.display()
+                )),
+            );
             return;
         }
         let title = if force {
@@ -1105,43 +1418,58 @@ impl App {
         }
     }
 
-    /// Open the Ollama model picker modal. No-op (with explanatory toast) if
-    /// Ollama isn't reachable or has no models installed.
+    /// Open the Ollama model picker modal. Always kicks off a fresh
+    /// `/api/tags` probe so the listed models reflect the live state of the
+    /// daemon (handy when the user just `ollama pull`-ed a new model in
+    /// another terminal). The picker opens immediately with whatever was
+    /// cached and swaps to the fresh list when the probe lands.
     fn open_model_picker(&mut self) {
-        let models = match &self.ollama {
+        let cached = match &self.ollama {
             OllamaAvailability::Ready { models } => models.clone(),
-            OllamaAvailability::NotRunning => {
-                self.toast =
-                    Some("ollama not running — start it with `ollama serve`".to_string());
-                return;
-            }
-            OllamaAvailability::NoModels => {
-                self.toast =
-                    Some("ollama running but no models — try `ollama pull qwen2.5-coder`"
-                        .to_string());
-                return;
-            }
-            OllamaAvailability::Unknown => {
-                self.toast = Some("still detecting ollama, try again in a moment".to_string());
-                return;
-            }
+            // Don't gate the picker behind a stale "not running" status —
+            // the user may have just started Ollama, and the fresh probe
+            // we're about to fire will tell us if that worked. Open the
+            // modal in refreshing state and let the result populate it.
+            _ => Vec::new(),
         };
         let current = self.config.ollama.model.as_deref();
-        self.model_picker = Some(ModelPickerState::new(models, current));
+        let mut picker = ModelPickerState::new(cached, current);
+        picker.refreshing = true;
+        self.model_picker = Some(picker);
+        self.spawn_ollama_probe();
+    }
+
+    /// Fire a one-shot `/api/tags` probe. Result lands on the event loop as
+    /// `AppEvent::OllamaAvailability`; the handler updates `self.ollama` and
+    /// (if open) refreshes the model picker.
+    fn spawn_ollama_probe(&self) {
+        let tx = self.events_tx.clone();
+        let base_url = self.config.ollama.base_url.clone();
+        tokio::spawn(async move {
+            let avail = ollama::detect(&base_url).await;
+            let _ = tx.send(AppEvent::OllamaAvailability(avail)).await;
+        });
     }
 
     fn handle_model_picker_key(&mut self, key: KeyEvent) {
         let Some(picker) = self.model_picker.as_mut() else {
             return;
         };
+        // Esc behavior is contextual: clear filter first, only close on a
+        // second Esc. Lets the user undo a typo without losing the modal.
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => {
-                self.model_picker = None;
+            KeyCode::Esc => {
+                if picker.filter.is_empty() {
+                    self.model_picker = None;
+                } else {
+                    picker.clear_filter();
+                }
             }
-            KeyCode::Char('j') | KeyCode::Down => picker.move_selection(1),
-            KeyCode::Char('k') | KeyCode::Up => picker.move_selection(-1),
+            KeyCode::Down => picker.move_selection(1),
+            KeyCode::Up => picker.move_selection(-1),
             KeyCode::PageDown => picker.move_selection(10),
             KeyCode::PageUp => picker.move_selection(-10),
+            KeyCode::Backspace => picker.pop_char(),
             KeyCode::Enter => {
                 let picked = picker.selected().map(String::from);
                 self.model_picker = None;
@@ -1157,14 +1485,213 @@ impl App {
                     }
                 }
             }
+            // Any printable char (including space, j/k/q) is treated as filter
+            // input — we deliberately don't reserve Vim-style nav here so the
+            // user can search for "qwen", "kr" etc. without hitting reserved keys.
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                picker.push_char(c);
+            }
             _ => {}
         }
+    }
+
+    /// Open the Settings modal. Always works (even when Ollama is down — the
+    /// modal will surface the unreachable state).
+    fn open_settings(&mut self) {
+        self.settings = Some(SettingsState::default());
+    }
+
+    fn handle_settings_key(&mut self, key: KeyEvent) {
+        let Some(state) = self.settings.as_mut() else {
+            return;
+        };
+
+        // Editing-text mode owns most keys.
+        if let Some(editor) = state.editor.as_mut() {
+            match key.code {
+                KeyCode::Esc => {
+                    state.editor = None;
+                }
+                KeyCode::Enter => {
+                    let edited = state.editor.take().unwrap();
+                    self.commit_settings_edit(edited);
+                }
+                KeyCode::Backspace => editor.backspace(),
+                KeyCode::Left => editor.left(),
+                KeyCode::Right => editor.right(),
+                KeyCode::Home => editor.home(),
+                KeyCode::End => editor.end(),
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    editor.insert(c);
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.settings = None;
+            }
+            KeyCode::Char('j') | KeyCode::Down => state.move_selection(1),
+            KeyCode::Char('k') | KeyCode::Up => state.move_selection(-1),
+            KeyCode::Enter => {
+                let row = state.selected;
+                self.activate_settings_row(row);
+            }
+            // Direct shortcut to open the picker even from inside settings.
+            KeyCode::Char('M') => {
+                self.settings = None;
+                self.open_model_picker();
+            }
+            _ => {}
+        }
+    }
+
+    /// Triggered when user presses Enter on (or clicks) a settings row.
+    fn activate_settings_row(&mut self, row: SettingsRow) {
+        match row {
+            SettingsRow::Model => {
+                self.settings = None;
+                self.open_model_picker();
+            }
+            SettingsRow::BaseUrl => {
+                if let Some(state) = self.settings.as_mut() {
+                    state.editor = Some(FieldEditor::new(
+                        SettingsRow::BaseUrl,
+                        self.config.ollama.base_url.clone(),
+                    ));
+                }
+            }
+            SettingsRow::SystemPrompt => {
+                if let Some(state) = self.settings.as_mut() {
+                    state.editor = Some(FieldEditor::new(
+                        SettingsRow::SystemPrompt,
+                        self.config.ollama.system_prompt.clone(),
+                    ));
+                }
+            }
+        }
+    }
+
+    fn handle_settings_click(&mut self, (x, y): (u16, u16)) {
+        let Some(state) = self.settings.as_ref() else {
+            return;
+        };
+        // While editing a field, ignore clicks (Esc/Enter exits the editor).
+        if state.editor.is_some() {
+            return;
+        }
+        let hit_row = state
+            .row_rects
+            .iter()
+            .find(|(_, r)| hit(*r, x, y))
+            .map(|(r, _)| *r);
+        if let Some(row) = hit_row {
+            if let Some(s) = self.settings.as_mut() {
+                s.selected = row;
+            }
+            self.activate_settings_row(row);
+        }
+    }
+
+    /// Persist a finished inline edit back into config + disk.
+    fn commit_settings_edit(&mut self, edited: FieldEditor) {
+        match edited.row {
+            SettingsRow::BaseUrl => {
+                let trimmed = edited.buf.trim().to_string();
+                if trimmed.is_empty() {
+                    self.toast = Some("base URL must not be empty".to_string());
+                    return;
+                }
+                self.config.ollama.base_url = trimmed;
+            }
+            SettingsRow::SystemPrompt => {
+                self.config.ollama.system_prompt = edited.buf;
+            }
+            SettingsRow::Model => return,
+        }
+        match config::save(&self.config) {
+            Ok(()) => {
+                self.toast = Some("settings saved".to_string());
+            }
+            Err(e) => {
+                self.toast = Some(format!("save failed: {e}"));
+            }
+        }
+    }
+
+    /// Open the generation modal directly in error state — used when a
+    /// preflight check fails before we ever talk to Ollama, so the failure
+    /// shows in the same modal the success path uses.
+    fn show_generation_error(&mut self, model: String, message: String) {
+        let mut g = GenerationDialog::streaming(model);
+        g.finish_error(message);
+        self.generation = Some(g);
+    }
+
+    /// Key dispatch while the generation modal is up. Locks the rest of the
+    /// UI: everything else gets ignored until the modal is dismissed.
+    async fn handle_generation_key(&mut self, key: KeyEvent) {
+        let Some(g) = self.generation.as_ref() else {
+            return;
+        };
+        match &g.phase {
+            GenerationPhase::Streaming { .. } => match key.code {
+                KeyCode::Esc => self.cancel_generation(),
+                _ => {}
+            },
+            GenerationPhase::Done { .. } => match key.code {
+                KeyCode::Enter => {
+                    // "Use it" — close the modal; the message is already in
+                    // input.buf, the user reviews it inline and Enters again
+                    // to actually commit. Two-step keeps it safe.
+                    self.generation = None;
+                }
+                KeyCode::Char('r') | KeyCode::Char('R') => {
+                    self.generation = None;
+                    self.start_generation().await;
+                }
+                KeyCode::Esc => {
+                    // Discard generated text, go back to normal mode.
+                    self.input.clear();
+                    self.input_mode = InputMode::Normal;
+                    self.generation = None;
+                }
+                _ => {}
+            },
+            GenerationPhase::Error { .. } => match key.code {
+                KeyCode::Char('r') | KeyCode::Char('R') => {
+                    self.generation = None;
+                    self.start_generation().await;
+                }
+                KeyCode::Esc | KeyCode::Enter => {
+                    self.generation = None;
+                }
+                _ => {}
+            },
+        }
+    }
+
+    /// Abort an in-flight generation: cancel the spawned task and close the
+    /// modal. Idempotent.
+    fn cancel_generation(&mut self) {
+        if let Some(handle) = self.gen_task.take() {
+            handle.abort();
+        }
+        self.input.generating = false;
+        self.input.clear();
+        self.input_mode = InputMode::Normal;
+        self.generation = None;
+        self.toast = Some("generation cancelled".to_string());
     }
 
     /// Kick off a streaming Ollama generation. Pre-flight checks the state
     /// (ollama reachable, model selected, something staged); on success enters
     /// commit-input mode with `generating=true` and spawns the generator.
     async fn start_generation(&mut self) {
+        // All preflight failures are surfaced through the modal too — silent
+        // toasts make it too easy to miss "ollama isn't running".
         let model = match &self.ollama {
             OllamaAvailability::Ready { models } => self
                 .config
@@ -1174,24 +1701,32 @@ impl App {
                 .filter(|m| models.contains(m))
                 .or_else(|| models.first().cloned()),
             OllamaAvailability::NotRunning => {
-                self.toast =
-                    Some("ollama not running — start it with `ollama serve`".to_string());
+                self.show_generation_error(
+                    "(unknown model)".to_string(),
+                    "Ollama is not running on this machine — connection refused at the configured base URL.".to_string(),
+                );
                 return;
             }
             OllamaAvailability::NoModels => {
-                self.toast = Some(
-                    "ollama running but no models — try `ollama pull qwen2.5-coder`".to_string(),
+                self.show_generation_error(
+                    "(none)".to_string(),
+                    "Ollama is running but has no models installed yet.".to_string(),
                 );
                 return;
             }
             OllamaAvailability::Unknown => {
-                self.toast =
-                    Some("still detecting ollama, try again in a moment".to_string());
+                self.show_generation_error(
+                    "(probing)".to_string(),
+                    "Still probing the local Ollama instance — try again in a moment.".to_string(),
+                );
                 return;
             }
         };
         let Some(model) = model else {
-            self.toast = Some("ollama has no models available".to_string());
+            self.show_generation_error(
+                "(none)".to_string(),
+                "Ollama has no models available to use.".to_string(),
+            );
             return;
         };
         let staged_count = self
@@ -1204,8 +1739,10 @@ impl App {
             })
             .count();
         if staged_count == 0 {
-            self.toast =
-                Some("nothing staged — press Space or `a` to stage first".to_string());
+            self.show_generation_error(
+                model.clone(),
+                "Nothing staged — stage at least one file before generating a commit message.".to_string(),
+            );
             return;
         }
 
@@ -1216,6 +1753,9 @@ impl App {
         self.input.clear();
         self.input.push_after = push_after;
         self.input.generating = true;
+        // Open the blocking modal so the user knows the app is busy and
+        // can't accidentally click around.
+        self.generation = Some(GenerationDialog::streaming(model.clone()));
 
         let root = self.repo.root.clone();
         let base_url = self.config.ollama.base_url.clone();
@@ -1240,11 +1780,26 @@ impl App {
                 return;
             }
             let (truncated, was_truncated) = truncate_diff(&diff);
-            let prompt = if was_truncated {
-                format!("Diff (truncated for length):\n\n{truncated}")
+            // Recent subjects act as a style anchor so the model matches this
+            // repo's voice (conventional commits, prefix style, tense). Best-
+            // effort: empty list on unborn repo or any git error.
+            let recent = git::log::recent_subjects(&root, 10).await;
+            let style_block = if recent.is_empty() {
+                String::new()
             } else {
-                format!("Diff:\n\n{truncated}")
+                let lines = recent
+                    .iter()
+                    .map(|s| format!("- {s}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!("Recent commit subjects from this repo (match this style):\n{lines}\n\n")
             };
+            let diff_header = if was_truncated {
+                "Diff (truncated for length):"
+            } else {
+                "Diff:"
+            };
+            let prompt = format!("{style_block}{diff_header}\n\n{truncated}");
 
             // Forwarder task: shuttles tokens from the generator's mpsc into
             // AppEvents so the UI can append them to the input bar.
@@ -1273,13 +1828,6 @@ impl App {
         self.gen_task = Some(handle);
     }
 
-    /// Abort any in-flight generation. Safe to call when nothing is running.
-    fn cancel_generation(&mut self) {
-        if let Some(handle) = self.gen_task.take() {
-            handle.abort();
-        }
-    }
-
     /// Run a write op in a background task; show toast with result; refresh.
     fn run_op_async(&self, label: &str, op: BoxedOp) {
         let tx = self.events_tx.clone();
@@ -1287,11 +1835,18 @@ impl App {
         tokio::spawn(async move {
             match op.await {
                 Ok(s) => {
-                    let _ = tx.send(AppEvent::LoadFailed(s)).await; // (re)using toast
+                    // Successes stay on the transient toast — they don't need
+                    // to interrupt the user.
+                    let _ = tx.send(AppEvent::LoadFailed(s)).await;
                 }
                 Err(e) => {
+                    // Failures get the modal popup treatment so the user sees
+                    // the actual git stderr instead of a fading toast.
                     let _ = tx
-                        .send(AppEvent::LoadFailed(format!("{label}: {e}")))
+                        .send(AppEvent::OpFailed {
+                            label: label.clone(),
+                            error: e.to_string(),
+                        })
                         .await;
                 }
             }
@@ -1489,6 +2044,18 @@ impl App {
         }
     }
 
+    /// Visible row count of the active pane's list area. Used by PageUp/Down
+    /// and Ctrl-U/D so paging scales with the terminal size instead of using
+    /// a fixed step. Returns 0 before the first frame has rendered.
+    fn active_viewport_height(&self) -> usize {
+        let r = match self.active_pane {
+            Pane::Branches => self.last_rects.branches_list,
+            Pane::Changes => self.last_rects.changes_list,
+            Pane::Graph => self.last_rects.graph_list,
+        };
+        r.height as usize
+    }
+
     /// Compute (target_id, title, fetch_future) for the current pane+selection.
     /// Returns None when there's nothing to preview (e.g. on Branches pane).
     fn current_preview_request(&self) -> Option<(String, String, BoxedFetch)> {
@@ -1586,6 +2153,8 @@ impl App {
         self.graph_upstream = upstream;
         self.graph_root = root;
         self.commits.clear();
+        self.graph_layout = None;
+        self.graph_truncated = false;
         self.ahead_shas.clear();
         self.behind_shas.clear();
         self.graph_state.select(Some(0));
@@ -1653,8 +2222,11 @@ impl App {
 
         tokio::spawn(async move {
             let result = match branch.as_deref() {
-                Some(name) => git::log::fetch_branch(&root, name, upstream.as_deref(), 500).await,
-                None => git::log::fetch(&root, 500).await,
+                Some(name) => {
+                    git::log::fetch_branch(&root, name, upstream.as_deref(), MAX_GRAPH_COMMITS)
+                        .await
+                }
+                None => git::log::fetch(&root, MAX_GRAPH_COMMITS).await,
             };
             match result {
                 Ok(commits) => {
@@ -1770,6 +2342,66 @@ impl App {
             self.spawn_pr_refresh();
         }
     }
+}
+
+/// Best-effort one-line hint for the user based on a failed git op's label
+/// and stderr. Pattern-matches common cases (worktree-blocked deletes,
+/// non-fast-forward push, dirty checkout) so the modal is actionable, not
+/// just a stack trace. Returns None when no useful suggestion applies.
+fn suggest_op_hint(label: &str, error: &str) -> Option<String> {
+    let lower = error.to_ascii_lowercase();
+    let label_lower = label.to_ascii_lowercase();
+
+    // git refuses to delete a branch that's checked out somewhere — including
+    // another worktree. The stderr usually mentions the worktree path.
+    if label_lower.starts_with("delete") && (lower.contains("checked out at") || lower.contains("worktree")) {
+        return Some(
+            "This branch is checked out in another worktree. Remove the worktree first \
+             with `git worktree remove <path>`, then try the delete again."
+                .to_string(),
+        );
+    }
+    if label_lower.starts_with("delete") && lower.contains("not fully merged") {
+        return Some(
+            "Branch has commits not yet merged into HEAD. If you really want to drop \
+             them, force-delete with capital D (`-D`) instead of `d` — but make sure \
+             those commits are reachable from another ref first."
+                .to_string(),
+        );
+    }
+    if label_lower.contains("push") && (lower.contains("non-fast-forward") || lower.contains("rejected")) {
+        return Some(
+            "Remote has commits you don't have. Pull (P) first to fast-forward, or \
+             force-push only if you're sure no one else is on this branch."
+                .to_string(),
+        );
+    }
+    if label_lower.contains("checkout") && lower.contains("would be overwritten") {
+        return Some(
+            "Local changes would be lost. Commit or stash them first, then retry the \
+             checkout."
+                .to_string(),
+        );
+    }
+    if lower.contains("permission denied") || lower.contains("publickey") {
+        return Some(
+            "Git auth failed. Check your SSH agent / credentials helper before retrying."
+                .to_string(),
+        );
+    }
+    None
+}
+
+/// True when the file is currently treated as staged for toggle purposes —
+/// any staged content counts, except for untracked/ignored entries. Used by
+/// the per-row toggle button to choose between `+` (stage) and `−` (unstage).
+/// Mirrors the historical `toggle_stage_selected` heuristic.
+pub(crate) fn is_fully_staged(file: &git::FileChange) -> bool {
+    file.staged.is_some()
+        && !matches!(
+            file.kind,
+            crate::git::ChangeKind::Untracked | crate::git::ChangeKind::Ignored
+        )
 }
 
 /// True when the point (x, y) lies inside `rect` (inclusive of borders so a
