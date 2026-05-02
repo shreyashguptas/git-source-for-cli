@@ -29,6 +29,14 @@ pub async fn untracked(repo_root: &Path, path: &str) -> Result<String> {
     .unwrap_or_default())
 }
 
+/// Full staged diff (everything in the index vs. HEAD). Empty string when
+/// nothing is staged. Used to feed Ollama for commit-message generation.
+pub async fn cached(repo_root: &Path) -> Result<String> {
+    exec::run(repo_root, ["diff", "--cached", "--no-color"])
+        .await
+        .context("git diff --cached failed")
+}
+
 /// Show a commit: full message + diff vs first parent (or empty parent for root).
 pub async fn show(repo_root: &Path, sha: &str) -> Result<String> {
     exec::run(

@@ -5,4 +5,5 @@ pub mod confirm;
 pub mod details;
 pub mod graph;
 pub mod help;
+pub mod model_picker;
 pub mod preview;

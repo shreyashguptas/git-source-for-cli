@@ -3,21 +3,28 @@
 VS Code's Source Control panel + Git Graph extension, in your terminal. One short command, four panes, full keyboard control. Live diff preview that updates as you arrow through commits.
 
 ```
-┌─ Branches (3) ───────┬─ Graph (12 commits) ───────────────┬─ Preview · 3ecf7a8 main: more readme ────┐
-│ * main      ↑2 ↓0    │ ●─╮  acdea64  HEAD → main          │ commit 3ecf7a8...                         │
-│   feature   +2 PR#41 │ ● │  3ecf7a8  main: more readme  ←│ Author: Shreyash Gupta                    │
-│   wip                │ │ ●  424b277  feat: more            │ Date:   2026-05-01 18:42                  │
-│                      │ │ ●  5cce256  feat: add feature.md  │                                           │
-├─ Changes (2) ────────┤ ●─╯  b628217  second                │     main: more readme                     │
-│ ● A staged.md        │ ●     f957320  init                  │                                           │
-│ ○ ? work.txt         │                                      │ diff --git a/README.md b/README.md        │
-│                      │                                      │ @@ -1,2 +1,3 @@                           │
-│                      │                                      │  hello                                    │
-│                      │                                      │  v2                                       │
-│                      │                                      │ +main work                                │
-└──────────────────────┴──────────────────────────────────────┴───────────────────────────────────────────┘
+┌─ Branches (3) ───────┬─ Graph · main ↔ origin/main · ↑1 to push · 12 commits ─┬─ Preview · acdea64 …─┐
+│ * main      ↑1 ↓0    │ ↑ ●─╮ acdea64 [ ◉ main ] new merge                      │ commit acdea64...    │
+│   feature   +2 PR#41 │   ● │ 3ecf7a8 [ ⎇ feature ]☁ wip on feature             │ Author: Shreyash G.  │
+│   wip                │   │ ●  424b277  feat: more                              │ Date:   2026-05-02   │
+│                      │   ●─╯ b628217 [ ◉ main-old ]☁ ▸ v1.0  release v1.0      │                      │
+├─ Changes (2) ────────┤   ●    f957320  init                                    │     new merge        │
+│ ● A staged.md        │                                                          │                      │
+│ ○ ? work.txt         │                                                          │ diff --git a/...     │
+│                      │                                                          │ @@ -1,2 +1,3 @@      │
+│                      │                                                          │ +main work           │
+└──────────────────────┴──────────────────────────────────────────────────────────┴──────────────────────┘
  gsc · main · 2 changes · gh: ✓ · graph · ↑↓ live preview · Enter full · o github · ? help · q quit
 ```
+
+**Reading the graph at a glance**:
+- `[ ◉ main ]` — coloured pill with the filled-circle icon: this is your **current HEAD**
+- `[ ⎇ feature ]` — coloured pill with the branch icon: a **local-only** branch
+- `☁` — cloud chip immediately after a pill: that branch is **also on origin** (in sync). No cloud = unpushed.
+- `[ ☁ origin/old ]` — standalone cloud pill: a branch that exists **only on origin** (you don't have it locally)
+- `▸ v1.0` — italic pill: a **tag**
+- `↑ ●` in the left margin: this commit is **ahead of origin** (will be pushed when you press `p`)
+- `↓ ●` in the left margin: this commit is **only on origin** (will arrive when you press `P`)
 
 **The big idea**: arrow up/down on the Graph (or Changes) pane and the right-side Preview updates instantly. No modal popups for casual browsing — `Enter` opens the full-screen view only when you want more room to scroll. Mouse works too: left-click any pane to focus + select, scroll wheel scrolls.
 

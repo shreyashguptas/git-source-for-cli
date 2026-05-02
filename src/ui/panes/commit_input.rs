@@ -19,6 +19,10 @@ pub struct InputState {
     pub cursor: usize,
     /// Optional flag set by app to drive `commit && push`.
     pub push_after: bool,
+    /// True while an Ollama generation is streaming into `buf`. While set, the
+    /// input ignores keystrokes (except Esc to cancel) so the user doesn't
+    /// fight the streamed text mid-flight.
+    pub generating: bool,
 }
 
 impl InputState {
@@ -26,11 +30,19 @@ impl InputState {
         self.buf.clear();
         self.cursor = 0;
         self.push_after = false;
+        self.generating = false;
     }
 
     pub fn insert(&mut self, c: char) {
         self.buf.insert(self.cursor, c);
         self.cursor += c.len_utf8();
+    }
+
+    /// Append text to the end of the buffer (used by streaming generation).
+    /// Always moves the cursor to the new end.
+    pub fn append(&mut self, s: &str) {
+        self.buf.push_str(s);
+        self.cursor = self.buf.len();
     }
 
     pub fn backspace(&mut self) {
@@ -78,7 +90,9 @@ impl InputState {
 }
 
 pub fn render(state: &InputState, area: Rect, frame: &mut Frame, theme: &Theme) {
-    let prompt = if state.push_after {
+    let prompt = if state.generating {
+        " ✨ generating (Esc cancel) > "
+    } else if state.push_after {
         " commit (then push) > "
     } else {
         " commit > "
@@ -92,7 +106,10 @@ pub fn render(state: &InputState, area: Rect, frame: &mut Frame, theme: &Theme) 
         .fg(theme.fg);
 
     // Compose: label + buffer + cursor caret + hint
-    let body_with_caret = if state.cursor == state.buf.len() {
+    let body_with_caret = if state.generating {
+        // Animated-ish caret to signal "writing now".
+        format!(" {}▌ ", state.buf)
+    } else if state.cursor == state.buf.len() {
         format!(" {} ▏ ", state.buf)
     } else {
         format!(" {}▏{} ", &state.buf[..state.cursor], &state.buf[state.cursor..])

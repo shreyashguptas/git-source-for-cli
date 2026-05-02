@@ -76,6 +76,13 @@ fn build_lines(theme: &Theme) -> Vec<Line<'static>> {
         row("↓N to pull", "origin has N commits you don't yet have"),
         row("↑ <commit>", "this specific commit is unpushed (left-margin marker)"),
         Line::from(""),
+        head("Ref pills next to commits"),
+        row("[ ◉ main ]", "filled-circle icon = this branch is your current HEAD"),
+        row("[ ⎇ feature ]", "branch icon = a local branch tip"),
+        row("☁  (after pill)", "branch is also on origin (in sync); absence = unpushed"),
+        row("[ ☁ origin/x ]", "remote-only branch (you don't have it locally)"),
+        row("▸ v1.0", "tag"),
+        Line::from(""),
         head("Branches pane"),
         row("Enter", "checkout selected branch (blocked if dirty)"),
         row("n", "new branch (type name, press Enter)"),
@@ -110,6 +117,13 @@ fn build_lines(theme: &Theme) -> Vec<Line<'static>> {
         row("Enter", "submit commit (or create branch when prefixed with 'branch:')"),
         row("Esc", "cancel"),
         row("← →  Home End  Backspace", "edit input"),
+        row("Ctrl-G", "(re)generate the commit message via Ollama"),
+        Line::from(""),
+        head("Ollama (local AI commit messages)"),
+        row("Ctrl-G", "stage some files, then press Ctrl-G — Ollama writes the subject"),
+        row("M", "open model picker (lists installed models; saves choice to ~/.config/gsc)"),
+        row("status bar", "shows ollama: ✓ <model> when reachable; ✗ when not running"),
+        row("config", "~/.config/gsc/config.json (base_url, model, system_prompt)"),
     ]
 }
 

@@ -18,7 +18,7 @@ path = "src/main.rs"
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
 clap = { version = "4", features = ["derive"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "sync", "time", "signal", "fs"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "sync", "time", "signal", "fs", "net", "io-util"] }
 anyhow = "1"
 thiserror = "2"
 tracing = "0.1"

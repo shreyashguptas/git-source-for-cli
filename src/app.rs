@@ -12,15 +12,18 @@ use ratatui::{backend::CrosstermBackend, layout::Rect, widgets::ListState, Termi
 use tokio::sync::mpsc;
 
 use crate::{
+    config::{self, Config},
     event::{spawn_event_loop, AppEvent},
     gh::{self, Availability, Pr},
     git::{self, Branch, ChangeKind, Commit, HeadRef, Repo, Status},
+    ollama::{self, Availability as OllamaAvailability},
     ui::{
         self,
         panes::{
             commit_input::InputState,
             confirm::{ConfirmAction, ConfirmDialog},
             details::DetailsContent,
+            model_picker::ModelPickerState,
         },
     },
 };
@@ -118,11 +121,22 @@ pub struct App {
 
     /// Most recent on-screen pane rectangles, written by `ui::view::render`.
     pub last_rects: PaneRects,
+
+    /// Persisted user config (Ollama settings, etc.). Loaded on startup,
+    /// rewritten on user-driven changes (e.g. picking a model).
+    pub config: Config,
+    /// Outcome of the most recent local-Ollama probe.
+    pub ollama: OllamaAvailability,
+    /// Active model-picker modal, if open.
+    pub model_picker: Option<ModelPickerState>,
+    /// Handle to the in-flight generation task — kept so Esc can abort it.
+    pub gen_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl App {
     pub async fn new(repo: Repo, events_tx: mpsc::Sender<AppEvent>) -> Result<Self> {
         let head = repo.head().await.unwrap_or(HeadRef::Unborn);
+        let config = config::load();
         let mut s = Self {
             repo,
             events_tx,
@@ -153,6 +167,10 @@ impl App {
             ahead_shas: HashSet::new(),
             behind_shas: HashSet::new(),
             last_rects: PaneRects::default(),
+            config,
+            ollama: OllamaAvailability::Unknown,
+            model_picker: None,
+            gen_task: None,
         };
         s.branches_state.select(Some(0));
         s.changes_state.select(Some(0));
@@ -232,6 +250,47 @@ impl App {
             AppEvent::LoadFailed(msg) => {
                 self.toast = Some(msg);
             }
+            AppEvent::OllamaAvailability(a) => {
+                self.ollama = a;
+                // If the user's saved model isn't available, fall back to the
+                // first listed model so Ctrl-G "just works" out of the box.
+                // We only auto-pick in memory — saving to disk is reserved for
+                // explicit user choice via the model picker.
+                if let OllamaAvailability::Ready { models } = &self.ollama {
+                    let need_pick = self
+                        .config
+                        .ollama
+                        .model
+                        .as_ref()
+                        .map_or(true, |m| !models.contains(m));
+                    if need_pick {
+                        if let Some(first) = models.first() {
+                            self.config.ollama.model = Some(first.clone());
+                        }
+                    }
+                }
+            }
+            AppEvent::OllamaToken(tok) => {
+                if self.input.generating {
+                    self.input.append(&tok);
+                }
+            }
+            AppEvent::OllamaDone(full) => {
+                if self.input.generating {
+                    self.input.generating = false;
+                    self.input.buf = clean_subject(&full);
+                    self.input.cursor = self.input.buf.len();
+                }
+                self.gen_task = None;
+            }
+            AppEvent::OllamaError(msg) => {
+                if self.input.generating || self.input_mode == InputMode::Commit {
+                    self.input.clear();
+                    self.input_mode = InputMode::Normal;
+                }
+                self.toast = Some(msg);
+                self.gen_task = None;
+            }
         }
     }
 
@@ -239,6 +298,34 @@ impl App {
         // global Ctrl-C quits unconditionally
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.should_quit = true;
+            return;
+        }
+
+        // Global Ctrl-G — start an Ollama-powered commit-message generation.
+        // Works from normal mode and from the commit-input bar (handy for
+        // "type `c` then Ctrl-G to autofill"). Suppressed inside modal contexts
+        // so users in the picker / help / confirm dialogs don't trigger it
+        // accidentally.
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('g') | KeyCode::Char('G'))
+        {
+            if self.show_help
+                || self.confirm.is_some()
+                || self.model_picker.is_some()
+                || self.overlay.is_some()
+            {
+                return;
+            }
+            if self.input.generating {
+                return;
+            }
+            self.start_generation().await;
+            return;
+        }
+
+        // Model picker has top-level priority once open (after global shortcuts).
+        if self.model_picker.is_some() {
+            self.handle_model_picker_key(key);
             return;
         }
 
@@ -396,6 +483,10 @@ impl App {
             KeyCode::Char('n') if self.active_pane == Pane::Branches => self.start_new_branch(),
             KeyCode::Char('m') if self.active_pane == Pane::Branches => self.confirm_merge(),
             KeyCode::Char('o') => self.open_in_browser(),
+
+            // Open the Ollama model picker. Only opens when ollama is reachable
+            // and has at least one model available.
+            KeyCode::Char('M') => self.open_model_picker(),
             _ => {}
         }
     }
@@ -567,6 +658,18 @@ impl App {
     }
 
     async fn handle_commit_input_key(&mut self, key: KeyEvent) {
+        // While the model is streaming into the buffer, only Esc is honored
+        // (cancel the in-flight generation). Other keys would race the stream.
+        if self.input.generating {
+            if matches!(key.code, KeyCode::Esc) {
+                self.cancel_generation();
+                self.input_mode = InputMode::Normal;
+                self.input.clear();
+                self.toast = Some("generation cancelled".to_string());
+            }
+            return;
+        }
+
         match key.code {
             KeyCode::Esc => {
                 self.input_mode = InputMode::Normal;
@@ -578,7 +681,13 @@ impl App {
             KeyCode::Right => self.input.right(),
             KeyCode::Home => self.input.home(),
             KeyCode::End => self.input.end(),
-            KeyCode::Char(c) => self.input.insert(c),
+            KeyCode::Char(c) => {
+                // Ignore Ctrl-/Alt-modified char events — they're shortcuts,
+                // not literal text. (Plain Shift is fine — produces 'A' etc.)
+                if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+                    self.input.insert(c);
+                }
+            }
             _ => {}
         }
     }
@@ -783,6 +892,181 @@ impl App {
                 });
                 self.run_op_async(&label, op);
             }
+        }
+    }
+
+    /// Open the Ollama model picker modal. No-op (with explanatory toast) if
+    /// Ollama isn't reachable or has no models installed.
+    fn open_model_picker(&mut self) {
+        let models = match &self.ollama {
+            OllamaAvailability::Ready { models } => models.clone(),
+            OllamaAvailability::NotRunning => {
+                self.toast =
+                    Some("ollama not running — start it with `ollama serve`".to_string());
+                return;
+            }
+            OllamaAvailability::NoModels => {
+                self.toast =
+                    Some("ollama running but no models — try `ollama pull qwen2.5-coder`"
+                        .to_string());
+                return;
+            }
+            OllamaAvailability::Unknown => {
+                self.toast = Some("still detecting ollama, try again in a moment".to_string());
+                return;
+            }
+        };
+        let current = self.config.ollama.model.as_deref();
+        self.model_picker = Some(ModelPickerState::new(models, current));
+    }
+
+    fn handle_model_picker_key(&mut self, key: KeyEvent) {
+        let Some(picker) = self.model_picker.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.model_picker = None;
+            }
+            KeyCode::Char('j') | KeyCode::Down => picker.move_selection(1),
+            KeyCode::Char('k') | KeyCode::Up => picker.move_selection(-1),
+            KeyCode::PageDown => picker.move_selection(10),
+            KeyCode::PageUp => picker.move_selection(-10),
+            KeyCode::Enter => {
+                let picked = picker.selected().map(String::from);
+                self.model_picker = None;
+                if let Some(name) = picked {
+                    self.config.ollama.model = Some(name.clone());
+                    match config::save(&self.config) {
+                        Ok(()) => {
+                            self.toast = Some(format!("model set to {name}"));
+                        }
+                        Err(e) => {
+                            self.toast = Some(format!("model set to {name} (save failed: {e})"));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Kick off a streaming Ollama generation. Pre-flight checks the state
+    /// (ollama reachable, model selected, something staged); on success enters
+    /// commit-input mode with `generating=true` and spawns the generator.
+    async fn start_generation(&mut self) {
+        let model = match &self.ollama {
+            OllamaAvailability::Ready { models } => self
+                .config
+                .ollama
+                .model
+                .clone()
+                .filter(|m| models.contains(m))
+                .or_else(|| models.first().cloned()),
+            OllamaAvailability::NotRunning => {
+                self.toast =
+                    Some("ollama not running — start it with `ollama serve`".to_string());
+                return;
+            }
+            OllamaAvailability::NoModels => {
+                self.toast = Some(
+                    "ollama running but no models — try `ollama pull qwen2.5-coder`".to_string(),
+                );
+                return;
+            }
+            OllamaAvailability::Unknown => {
+                self.toast =
+                    Some("still detecting ollama, try again in a moment".to_string());
+                return;
+            }
+        };
+        let Some(model) = model else {
+            self.toast = Some("ollama has no models available".to_string());
+            return;
+        };
+        let staged_count = self
+            .status
+            .files
+            .iter()
+            .filter(|f| {
+                f.staged.is_some()
+                    && !matches!(f.kind, ChangeKind::Untracked | ChangeKind::Ignored)
+            })
+            .count();
+        if staged_count == 0 {
+            self.toast =
+                Some("nothing staged — press Space or `a` to stage first".to_string());
+            return;
+        }
+
+        // Switch the input bar into streaming mode. Preserve `push_after` if
+        // the user already opened it via `C` (commit+push).
+        let push_after = self.input.push_after;
+        self.input_mode = InputMode::Commit;
+        self.input.clear();
+        self.input.push_after = push_after;
+        self.input.generating = true;
+
+        let root = self.repo.root.clone();
+        let base_url = self.config.ollama.base_url.clone();
+        let system = self.config.ollama.system_prompt.clone();
+        let tx = self.events_tx.clone();
+
+        let handle = tokio::spawn(async move {
+            // Fetch the staged diff. Empty = nothing to summarize.
+            let diff = match git::diff::cached(&root).await {
+                Ok(d) => d,
+                Err(e) => {
+                    let _ = tx
+                        .send(AppEvent::OllamaError(format!("git diff: {e}")))
+                        .await;
+                    return;
+                }
+            };
+            if diff.trim().is_empty() {
+                let _ = tx
+                    .send(AppEvent::OllamaError("staged diff is empty".to_string()))
+                    .await;
+                return;
+            }
+            let (truncated, was_truncated) = truncate_diff(&diff);
+            let prompt = if was_truncated {
+                format!("Diff (truncated for length):\n\n{truncated}")
+            } else {
+                format!("Diff:\n\n{truncated}")
+            };
+
+            // Forwarder task: shuttles tokens from the generator's mpsc into
+            // AppEvents so the UI can append them to the input bar.
+            let (tok_tx, mut tok_rx) = mpsc::channel::<String>(64);
+            let tx_fwd = tx.clone();
+            let forwarder = tokio::spawn(async move {
+                while let Some(tok) = tok_rx.recv().await {
+                    if tx_fwd.send(AppEvent::OllamaToken(tok)).await.is_err() {
+                        break;
+                    }
+                }
+            });
+
+            match ollama::generate_stream(&base_url, &model, &system, &prompt, tok_tx).await {
+                Ok(full) => {
+                    // Wait for the forwarder to drain so all tokens land before Done.
+                    let _ = forwarder.await;
+                    let _ = tx.send(AppEvent::OllamaDone(full)).await;
+                }
+                Err(e) => {
+                    forwarder.abort();
+                    let _ = tx.send(AppEvent::OllamaError(format!("ollama: {e}"))).await;
+                }
+            }
+        });
+        self.gen_task = Some(handle);
+    }
+
+    /// Abort any in-flight generation. Safe to call when nothing is running.
+    fn cancel_generation(&mut self) {
+        if let Some(handle) = self.gen_task.take() {
+            handle.abort();
         }
     }
 
@@ -1133,6 +1417,47 @@ fn github_web_url(remote: &str) -> Option<String> {
     None
 }
 
+/// Cap a staged diff before sending to Ollama. Most local models choke on
+/// 100k-token inputs and the commit subject is determined by the high-level
+/// file/hunk structure anyway, so chopping at ~8k lines / 32 KB is a sane
+/// budget. The boolean signals whether truncation actually happened so the
+/// prompt can disclose that.
+const MAX_DIFF_LINES: usize = 8000;
+const MAX_DIFF_BYTES: usize = 32 * 1024;
+
+fn truncate_diff(diff: &str) -> (String, bool) {
+    let mut out = String::new();
+    let mut truncated = false;
+    for (i, line) in diff.lines().enumerate() {
+        if i >= MAX_DIFF_LINES || out.len() + line.len() + 1 > MAX_DIFF_BYTES {
+            truncated = true;
+            break;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    (out, truncated)
+}
+
+/// Coerce the raw streamed model output into a single commit subject line:
+/// take the first non-empty line, strip stray quotes some models add, and cap
+/// the length defensively.
+fn clean_subject(raw: &str) -> String {
+    let line = raw
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("")
+        .trim_matches(|c: char| c == '"' || c == '\'' || c == '`')
+        .trim()
+        .to_string();
+    if line.chars().count() > 200 {
+        line.chars().take(200).collect()
+    } else {
+        line
+    }
+}
+
 fn clamp_selection(state: &mut ListState, len: usize) {
     if len == 0 {
         state.select(None);
@@ -1156,6 +1481,17 @@ pub async fn launch(
         tokio::spawn(async move {
             let avail = gh::detect().await;
             let _ = tx.send(AppEvent::GhAvailability(avail)).await;
+        });
+    }
+
+    // Detect a local Ollama instance — same async-on-startup pattern as `gh`.
+    // Uses the base URL from the (possibly just-loaded) user config.
+    {
+        let tx = tx.clone();
+        let base_url = app.config.ollama.base_url.clone();
+        tokio::spawn(async move {
+            let avail = ollama::detect(&base_url).await;
+            let _ = tx.send(AppEvent::OllamaAvailability(avail)).await;
         });
     }
 

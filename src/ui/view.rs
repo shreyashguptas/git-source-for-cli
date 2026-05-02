@@ -9,6 +9,7 @@ use crate::{
     app::{App, InputMode, Pane, PaneRects},
     gh::Availability,
     git::HeadRef,
+    ollama::Availability as OllamaAvailability,
     ui::{panes, theme},
 };
 
@@ -57,6 +58,12 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     }
     if let Some(dialog) = app.confirm.clone() {
         panes::confirm::render(&dialog, area, frame, &theme);
+    }
+    if app.model_picker.is_some() {
+        let current = app.config.ollama.model.clone();
+        if let Some(picker) = app.model_picker.as_mut() {
+            panes::model_picker::render(picker, current.as_deref(), area, frame, &theme);
+        }
     }
 }
 
@@ -125,13 +132,22 @@ fn render_status_bar(app: &App, frame: &mut Frame, area: Rect, theme: &theme::Th
         ""
     };
     let gh_label = match app.gh {
-        Availability::Ready => "gh: ✓",
-        Availability::NotAuthed => "gh: not authed",
-        Availability::NotInstalled => "gh: ✗",
+        Availability::Ready => "gh: ✓".to_string(),
+        Availability::NotAuthed => "gh: not authed".to_string(),
+        Availability::NotInstalled => "gh: ✗".to_string(),
+    };
+    let ollama_label = match &app.ollama {
+        OllamaAvailability::Ready { .. } => match app.config.ollama.model.as_deref() {
+            Some(m) => format!("ollama: ✓ {m}"),
+            None => "ollama: ✓".to_string(),
+        },
+        OllamaAvailability::NoModels => "ollama: no models".to_string(),
+        OllamaAvailability::NotRunning => "ollama: ✗".to_string(),
+        OllamaAvailability::Unknown => "ollama: …".to_string(),
     };
     let hints = pane_hints(app);
     let text = format!(
-        " gsc · {head_label}{track_label} · {} changes · {gh_label} · {pane_label}{mode_label} · {hints} · ? help · q quit ",
+        " gsc · {head_label}{track_label} · {} changes · {gh_label} · {ollama_label} · {pane_label}{mode_label} · {hints} · ? help · q quit ",
         app.status.files.len(),
     );
     let bar = Paragraph::new(Span::raw(text)).style(theme.status_bar());
@@ -142,11 +158,14 @@ fn render_status_bar(app: &App, frame: &mut Frame, area: Rect, theme: &theme::Th
 /// for the most common actions without opening the help overlay.
 fn pane_hints(app: &App) -> &'static str {
     if app.input_mode == InputMode::Commit {
-        return "Enter commit · Esc cancel";
+        if app.input.generating {
+            return "streaming… · Esc cancel";
+        }
+        return "Enter commit · ^G regenerate · Esc cancel";
     }
     match app.active_pane {
-        Pane::Branches => "Enter checkout · n new · p push · P pull · m merge · d del",
-        Pane::Changes => "Space stage · a all · c commit · C commit+push · x discard",
+        Pane::Branches => "Enter checkout · n new · p push · P pull · m merge · d del · M model",
+        Pane::Changes => "Space stage · a all · c commit · ^G ai-commit · M model · x discard",
         Pane::Graph => "↑↓ live preview · Enter full · o github",
     }
 }
