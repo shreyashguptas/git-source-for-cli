@@ -6,7 +6,7 @@ use ratatui::{
 };
 
 use crate::{
-    app::{App, InputMode, Pane},
+    app::{App, InputMode, Pane, PaneRects},
     gh::Availability,
     git::HeadRef,
     ui::{panes, theme},
@@ -85,6 +85,14 @@ fn render_main(app: &mut App, frame: &mut Frame, area: Rect, theme: &theme::Them
         .direction(Direction::Vertical)
         .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
         .split(cols[0]);
+
+    // Capture rects for the mouse handler (clicks need to know what's where).
+    app.last_rects = PaneRects {
+        branches: left[0],
+        changes: left[1],
+        graph: cols[1],
+        preview: if show_preview { Some(cols[2]) } else { None },
+    };
 
     panes::branches::render(app, left[0], frame, theme);
     panes::changes::render(app, left[1], frame, theme);

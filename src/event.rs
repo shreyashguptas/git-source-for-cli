@@ -1,10 +1,10 @@
 use std::time::Duration;
 
-use crossterm::event::{Event as CtEvent, EventStream, KeyEvent};
+use crossterm::event::{Event as CtEvent, EventStream, KeyEvent, MouseEvent};
 use futures_util::{FutureExt, StreamExt};
 use tokio::{sync::mpsc, time::interval};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::{
     gh::{Availability, Pr},
@@ -17,6 +17,7 @@ use crate::{
 pub enum AppEvent {
     Tick,
     Key(KeyEvent),
+    Mouse(MouseEvent),
     Resize(u16, u16),
     Quit,
 
@@ -24,6 +25,9 @@ pub enum AppEvent {
     BranchesLoaded(Vec<Branch>),
     CommitsLoaded(Vec<Commit>),
     StatusLoaded(Status),
+    /// SHAs of commits that are local-only vs HEAD's upstream (`@{upstream}..HEAD`)
+    /// and the inverse (`HEAD..@{upstream}`). Empty when there's no upstream.
+    DivergenceLoaded { ahead: HashSet<String>, behind: HashSet<String> },
     GhAvailability(Availability),
     PrsLoaded(HashMap<String, Pr>),
     /// Async-loaded body for the details overlay.
@@ -50,6 +54,7 @@ pub fn spawn_event_loop(buf: usize, tick_rate: Duration) -> (mpsc::Sender<AppEve
                 let Ok(event) = maybe_event else { continue };
                 let app_event = match event {
                     CtEvent::Key(k) => AppEvent::Key(k),
+                    CtEvent::Mouse(m) => AppEvent::Mouse(m),
                     CtEvent::Resize(w, h) => AppEvent::Resize(w, h),
                     _ => continue,
                 };

@@ -1,8 +1,14 @@
-use std::{collections::HashMap, future::Future, io, pin::Pin, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    future::Future,
+    io,
+    pin::Pin,
+    time::Duration,
+};
 
 use anyhow::Result;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::{backend::CrosstermBackend, widgets::ListState, Terminal};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::{backend::CrosstermBackend, layout::Rect, widgets::ListState, Terminal};
 use tokio::sync::mpsc;
 
 use crate::{
@@ -55,6 +61,16 @@ pub enum InputMode {
     Commit,
 }
 
+/// Where each pane was last rendered on screen — used by the mouse handler
+/// to hit-test clicks. Updated by the view code on every render.
+#[derive(Debug, Clone, Default)]
+pub struct PaneRects {
+    pub branches: Rect,
+    pub changes: Rect,
+    pub graph: Rect,
+    pub preview: Option<Rect>,
+}
+
 /// Top-level application state.
 pub struct App {
     pub repo: Repo,
@@ -94,6 +110,14 @@ pub struct App {
     pub gh: Availability,
     pub prs: HashMap<String, Pr>,
     pub prs_last_refresh: std::time::Instant,
+
+    /// Commits the local HEAD has but origin doesn't (i.e. unpushed).
+    pub ahead_shas: HashSet<String>,
+    /// Commits origin has but the local HEAD doesn't (i.e. unpulled).
+    pub behind_shas: HashSet<String>,
+
+    /// Most recent on-screen pane rectangles, written by `ui::view::render`.
+    pub last_rects: PaneRects,
 }
 
 impl App {
@@ -126,6 +150,9 @@ impl App {
             gh: Availability::NotInstalled,
             prs: HashMap::new(),
             prs_last_refresh: std::time::Instant::now() - Duration::from_secs(3600),
+            ahead_shas: HashSet::new(),
+            behind_shas: HashSet::new(),
+            last_rects: PaneRects::default(),
         };
         s.branches_state.select(Some(0));
         s.changes_state.select(Some(0));
@@ -156,6 +183,7 @@ impl App {
             AppEvent::Quit => self.should_quit = true,
             AppEvent::Resize(w, h) => self.size = (w, h),
             AppEvent::Key(key) => self.handle_key(key).await,
+            AppEvent::Mouse(m) => self.handle_mouse(m),
             AppEvent::Tick => {
                 self.spawn_refresh();
             }
@@ -173,6 +201,10 @@ impl App {
                 clamp_selection(&mut self.changes_state, s.files.len());
                 self.status = s;
                 self.update_preview();
+            }
+            AppEvent::DivergenceLoaded { ahead, behind } => {
+                self.ahead_shas = ahead;
+                self.behind_shas = behind;
             }
             AppEvent::OverlayLoaded(c) => {
                 if self.overlay.is_some() {
@@ -421,6 +453,117 @@ impl App {
         let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
         let web = github_web_url(&url)?;
         Some(format!("{web}/commit/{sha}"))
+    }
+
+    /// Mouse handling: left-click focuses + selects, scroll wheel scrolls.
+    /// Modal overlays consume scroll only; clicks on them do nothing (use Esc).
+    fn handle_mouse(&mut self, ev: MouseEvent) {
+        let pos = (ev.column, ev.row);
+
+        // Modal overlays own the scroll wheel.
+        let overlay_active = self.show_help || self.confirm.is_some();
+        if self.overlay.is_some() {
+            match ev.kind {
+                MouseEventKind::ScrollUp => self.scroll_overlay(-3),
+                MouseEventKind::ScrollDown => self.scroll_overlay(3),
+                _ => {}
+            }
+            return;
+        }
+        if overlay_active {
+            // Help/confirm don't scroll; ignore mouse entirely.
+            return;
+        }
+
+        // Don't redirect mouse while typing a commit message — it shouldn't
+        // accidentally move selection mid-type.
+        if self.input_mode == InputMode::Commit {
+            return;
+        }
+
+        match ev.kind {
+            MouseEventKind::Down(MouseButton::Left) => self.handle_mouse_click(pos),
+            MouseEventKind::ScrollUp => self.handle_mouse_scroll(pos, -3),
+            MouseEventKind::ScrollDown => self.handle_mouse_scroll(pos, 3),
+            _ => {}
+        }
+    }
+
+    fn handle_mouse_click(&mut self, (x, y): (u16, u16)) {
+        // Clone rect copies because borrows below would clash with self.update_preview()
+        let rects = self.last_rects.clone();
+        if hit(rects.branches, x, y) {
+            self.active_pane = Pane::Branches;
+            self.click_select_in_pane(rects.branches, y, Pane::Branches);
+            self.update_preview();
+        } else if hit(rects.changes, x, y) {
+            self.active_pane = Pane::Changes;
+            self.click_select_in_pane(rects.changes, y, Pane::Changes);
+            self.update_preview();
+        } else if hit(rects.graph, x, y) {
+            self.active_pane = Pane::Graph;
+            self.click_select_in_pane(rects.graph, y, Pane::Graph);
+            self.update_preview();
+        } else if let Some(p) = rects.preview {
+            if hit(p, x, y) {
+                // Clicking the preview pane just gives it scroll focus; we don't
+                // change the selected pane (the preview mirrors Graph/Changes).
+                // No-op for now.
+            }
+        }
+    }
+
+    fn click_select_in_pane(&mut self, rect: Rect, y: u16, pane: Pane) {
+        // Inside a bordered Block, the first content row is at rect.y + 1.
+        if y < rect.y + 1 || y >= rect.y + rect.height.saturating_sub(1) {
+            return; // border row
+        }
+        let row_in_pane = (y - rect.y - 1) as usize;
+        let (state, len) = match pane {
+            Pane::Branches => (&mut self.branches_state, self.branches.len()),
+            Pane::Changes => (&mut self.changes_state, self.status.files.len()),
+            Pane::Graph => (&mut self.graph_state, self.commits.len()),
+        };
+        let target = state.offset() + row_in_pane;
+        if target < len {
+            state.select(Some(target));
+        }
+    }
+
+    fn handle_mouse_scroll(&mut self, (x, y): (u16, u16), delta: isize) {
+        let rects = self.last_rects.clone();
+        if let Some(p) = rects.preview {
+            if hit(p, x, y) {
+                // Scroll the preview content directly.
+                self.scroll_preview(delta);
+                return;
+            }
+        }
+        // Scroll inside list panes = move the selection (visible scroll).
+        if hit(rects.branches, x, y) {
+            self.active_pane = Pane::Branches;
+            self.move_selection(delta);
+        } else if hit(rects.changes, x, y) {
+            self.active_pane = Pane::Changes;
+            self.move_selection(delta);
+        } else if hit(rects.graph, x, y) {
+            self.active_pane = Pane::Graph;
+            self.move_selection(delta);
+        } else {
+            // Click outside any pane — scroll the active one as a sensible default.
+            self.move_selection(delta);
+        }
+    }
+
+    fn scroll_preview(&mut self, delta: isize) {
+        let max = self
+            .preview
+            .as_ref()
+            .map(|c| c.line_count() as isize - 1)
+            .unwrap_or(0)
+            .max(0);
+        let next = (self.preview_scroll as isize + delta).clamp(0, max);
+        self.preview_scroll = next as u16;
     }
 
     async fn handle_commit_input_key(&mut self, key: KeyEvent) {
@@ -946,6 +1089,15 @@ impl App {
             }
         });
 
+        // Divergence vs upstream — what's local-only / unpulled. Cheap call.
+        let tx = self.events_tx.clone();
+        let root = self.repo.root.clone();
+        tokio::spawn(async move {
+            let ahead = git::log::ahead_of_upstream(&root).await;
+            let behind = git::log::behind_upstream(&root).await;
+            let _ = tx.send(AppEvent::DivergenceLoaded { ahead, behind }).await;
+        });
+
         // PR refresh: throttled to once per 60s.
         if self.gh == Availability::Ready
             && self.prs_last_refresh.elapsed() >= Duration::from_secs(60)
@@ -953,6 +1105,17 @@ impl App {
             self.spawn_pr_refresh();
         }
     }
+}
+
+/// True when the point (x, y) lies inside `rect` (inclusive of borders so a
+/// click on a pane border still focuses that pane).
+fn hit(rect: Rect, x: u16, y: u16) -> bool {
+    rect.width > 0
+        && rect.height > 0
+        && x >= rect.x
+        && x < rect.x + rect.width
+        && y >= rect.y
+        && y < rect.y + rect.height
 }
 
 /// `git@github.com:owner/repo.git` or `https://github.com/owner/repo(.git)?` → web URL.

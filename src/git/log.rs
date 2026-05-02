@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{collections::HashSet, path::Path};
 
 use anyhow::{Context, Result};
 
@@ -45,6 +45,51 @@ pub async fn fetch(repo_root: &Path, limit: usize) -> Result<Vec<Commit>> {
         .filter(|l| !l.is_empty())
         .filter_map(parse_line)
         .collect())
+}
+
+/// SHAs that are reachable from HEAD but NOT from HEAD's upstream — i.e.
+/// commits the current branch has that origin doesn't.
+///
+/// Returns an empty set if there's no upstream, no HEAD, or any other error
+/// (we don't want to spam the user with toast warnings on every refresh).
+pub async fn ahead_of_upstream(repo_root: &Path) -> HashSet<String> {
+    match exec::run_optional(
+        repo_root,
+        ["rev-list", "@{upstream}..HEAD", "--pretty=format:%H"],
+    )
+    .await
+    {
+        Ok(Some(out)) => out
+            .lines()
+            // `--pretty=format:%H` emits both the format line AND a "commit X" line;
+            // we only want the bare SHAs.
+            .filter(|l| !l.starts_with("commit "))
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(String::from)
+            .collect(),
+        _ => HashSet::new(),
+    }
+}
+
+/// SHAs reachable from HEAD's upstream but NOT from HEAD — commits origin
+/// has that the local branch doesn't (i.e. behind).
+pub async fn behind_upstream(repo_root: &Path) -> HashSet<String> {
+    match exec::run_optional(
+        repo_root,
+        ["rev-list", "HEAD..@{upstream}", "--pretty=format:%H"],
+    )
+    .await
+    {
+        Ok(Some(out)) => out
+            .lines()
+            .filter(|l| !l.starts_with("commit "))
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(String::from)
+            .collect(),
+        _ => HashSet::new(),
+    }
 }
 
 fn parse_line(line: &str) -> Option<Commit> {

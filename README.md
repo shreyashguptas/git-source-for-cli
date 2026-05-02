@@ -19,7 +19,9 @@ VS Code's Source Control panel + Git Graph extension, in your terminal. One shor
  gsc · main · 2 changes · gh: ✓ · graph · ↑↓ live preview · Enter full · o github · ? help · q quit
 ```
 
-**The big idea**: arrow up/down on the Graph (or Changes) pane and the right-side Preview updates instantly. No clicking. No modal popups for casual browsing — `Enter` opens the full-screen view only when you want more room to scroll.
+**The big idea**: arrow up/down on the Graph (or Changes) pane and the right-side Preview updates instantly. No modal popups for casual browsing — `Enter` opens the full-screen view only when you want more room to scroll. Mouse works too: left-click any pane to focus + select, scroll wheel scrolls.
+
+**Origin sync at a glance**: the Graph header shows `main ↔ origin/main · ↑3 to push · ↓0 to pull` so you always know how far ahead/behind you are. Each unpushed commit gets a `↑` marker in the left margin.
 
 ## Install
 
@@ -62,6 +64,17 @@ gsc --path /elsewhere/repo    # operate on a repo outside cwd
 gsc -v                        # verbose logs to stderr (redirect to file to inspect)
 gsc --help
 ```
+
+## Mouse
+
+`gsc` accepts mouse input alongside the keyboard:
+
+| Action | Result |
+|---|---|
+| Left-click a pane | focus that pane and select the item under the cursor |
+| Scroll wheel inside a pane | scroll that pane (Preview scrolls its content; Branches/Changes/Graph move the selection) |
+
+**macOS tip**: while mouse capture is on, normal text-selection in the terminal is intercepted. Hold **Option** while dragging to bypass capture and select text natively (works in Terminal, iTerm2, Ghostty, Warp, kitty).
 
 ## Keybindings
 
