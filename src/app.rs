@@ -104,6 +104,19 @@ pub enum ResizeDrag {
     BranchesChanges,
 }
 
+/// Actions exposed as clickable buttons in the Branches pane toolbar.
+/// Same dispatch as the keyboard shortcuts (`Enter` / `n` / `p` / `P` / `f` / `m` / `d`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BranchAction {
+    Checkout,
+    NewBranch,
+    Push,
+    Pull,
+    Fetch,
+    Merge,
+    Delete,
+}
+
 /// Top-level application state.
 pub struct App {
     pub repo: Repo,
@@ -170,6 +183,11 @@ pub struct App {
     pub layout_overrides: LayoutOverrides,
     /// Active drag, if any. Set on left-button down over a splitter, cleared on up.
     pub active_drag: ResizeDrag,
+
+    /// On-screen rects of the Branches-pane toolbar buttons, written each
+    /// render. Click handler hit-tests these to dispatch the corresponding
+    /// `BranchAction`.
+    pub branch_button_rects: Vec<(BranchAction, Rect)>,
 }
 
 impl App {
@@ -213,6 +231,7 @@ impl App {
             gen_task: None,
             layout_overrides: LayoutOverrides::default(),
             active_drag: ResizeDrag::None,
+            branch_button_rects: Vec::new(),
         };
         s.branches_state.select(Some(0));
         s.changes_state.select(Some(0));
@@ -640,6 +659,12 @@ impl App {
             return;
         }
 
+        // Second: did they click a Branches-pane toolbar button?
+        if let Some(action) = self.detect_branch_button(x, y) {
+            self.run_branch_action(action);
+            return;
+        }
+
         let rects = self.last_rects.clone();
         if hit(rects.branches, x, y) {
             self.active_pane = Pane::Branches;
@@ -658,6 +683,13 @@ impl App {
                 // Preview clicks: no-op (it mirrors Graph/Changes selection).
             }
         }
+    }
+
+    fn detect_branch_button(&self, x: u16, y: u16) -> Option<BranchAction> {
+        self.branch_button_rects
+            .iter()
+            .find(|(_, r)| hit(*r, x, y))
+            .map(|(a, _)| *a)
     }
 
     /// Did the click land exactly on a splitter (the actual border line)?
@@ -1234,44 +1266,75 @@ impl App {
 
     async fn handle_enter(&mut self) {
         match self.active_pane {
-            Pane::Branches => {
-                let Some(idx) = self.branches_state.selected() else {
-                    return;
-                };
-                let Some(b) = self.branches.get(idx) else {
-                    return;
-                };
-                if b.is_current {
-                    self.toast = Some(format!("already on '{}'", b.name));
-                    return;
-                }
-                // Branches checked out in another worktree can't be checked out
-                // here — git would error and the user wouldn't know why.
-                if let Some(wt) = self.worktrees.get(&b.name) {
-                    if wt != &self.repo.root {
-                        self.toast = Some(format!(
-                            "'{}' is checked out in another worktree at {} — checkout blocked",
-                            b.name,
-                            wt.display()
-                        ));
-                        return;
-                    }
-                }
-                if !self.status.files.is_empty() {
-                    self.toast = Some(format!(
-                        "checkout '{}' blocked: working tree has changes (commit / stash / discard first)",
-                        b.name
-                    ));
-                    return;
-                }
-                let name = b.name.clone();
-                let root = self.repo.root.clone();
-                self.run_op_async(
-                    &format!("checkout {name}"),
-                    Box::pin(async move { git::ops::checkout(&root, &name).await }),
-                );
-            }
+            Pane::Branches => self.checkout_selected_branch(),
             Pane::Changes | Pane::Graph => self.open_details().await,
+        }
+    }
+
+    /// Checkout the currently selected branch. Synchronous-callable so the
+    /// toolbar button can invoke it directly from the (sync) mouse handler.
+    fn checkout_selected_branch(&mut self) {
+        let Some(idx) = self.branches_state.selected() else {
+            return;
+        };
+        let Some(b) = self.branches.get(idx) else {
+            return;
+        };
+        if b.is_current {
+            self.toast = Some(format!("already on '{}'", b.name));
+            return;
+        }
+        if let Some(wt) = self.worktrees.get(&b.name) {
+            if wt != &self.repo.root {
+                self.toast = Some(format!(
+                    "'{}' is checked out in another worktree at {} — checkout blocked",
+                    b.name,
+                    wt.display()
+                ));
+                return;
+            }
+        }
+        if !self.status.files.is_empty() {
+            self.toast = Some(format!(
+                "checkout '{}' blocked: working tree has changes (commit / stash / discard first)",
+                b.name
+            ));
+            return;
+        }
+        let name = b.name.clone();
+        let root = self.repo.root.clone();
+        self.run_op_async(
+            &format!("checkout {name}"),
+            Box::pin(async move { git::ops::checkout(&root, &name).await }),
+        );
+    }
+
+    /// Dispatch a Branches-pane action — same effect as the matching keyboard
+    /// shortcut. Used by toolbar button clicks.
+    pub fn run_branch_action(&mut self, action: BranchAction) {
+        // Make sure the user's mental model matches: clicking a button focuses
+        // the Branches pane.
+        self.active_pane = Pane::Branches;
+        match action {
+            BranchAction::Checkout => self.checkout_selected_branch(),
+            BranchAction::NewBranch => self.start_new_branch(),
+            BranchAction::Push => self.spawn_push(),
+            BranchAction::Pull => self.run_op_async(
+                "pull --ff-only",
+                Box::pin({
+                    let r = self.repo.root.clone();
+                    async move { git::ops::pull(&r).await }
+                }),
+            ),
+            BranchAction::Fetch => self.run_op_async(
+                "fetch --all",
+                Box::pin({
+                    let r = self.repo.root.clone();
+                    async move { git::ops::fetch_all(&r).await }
+                }),
+            ),
+            BranchAction::Merge => self.confirm_merge(),
+            BranchAction::Delete => self.confirm_delete(false),
         }
     }
 

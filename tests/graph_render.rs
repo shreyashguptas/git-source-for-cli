@@ -116,15 +116,23 @@ fn renders_branch_and_remote_pills() {
     let lines: Vec<&str> = out.lines().collect();
     // HEAD pill should appear on the newest commit
     assert!(lines[0].contains("◉ main"), "expected HEAD pill on row 0: {:?}", lines[0]);
-    // ☁ chip should appear when local + remote co-exist
-    assert!(lines[0].contains('☁'), "expected cloud chip on row 0: {:?}", lines[0]);
+    // `synced` chip should appear when local + remote co-exist
+    assert!(lines[0].contains("synced"), "expected synced chip on row 0: {:?}", lines[0]);
     // Tag pill
     assert!(lines[0].contains("▸ v1.0"), "expected tag pill on row 0: {:?}", lines[0]);
     // Local-only branch
     assert!(lines[1].contains("⎇ feature"), "expected local pill on row 1: {:?}", lines[1]);
-    assert!(!lines[1].contains('☁'), "row 1 has no remote, no cloud: {:?}", lines[1]);
-    // Remote-only branch
-    assert!(lines[2].contains("☁ origin/abandoned"), "expected remote pill on row 2: {:?}", lines[2]);
+    assert!(
+        !lines[1].contains("synced"),
+        "row 1 has no remote, no synced chip: {:?}",
+        lines[1]
+    );
+    // Remote-only branch — ↓ + origin/<name> indicates "would pull"
+    assert!(
+        lines[2].contains("↓ origin/abandoned"),
+        "expected remote-only pill on row 2: {:?}",
+        lines[2]
+    );
 }
 
 #[test]

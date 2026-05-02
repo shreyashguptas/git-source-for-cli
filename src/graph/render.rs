@@ -167,10 +167,15 @@ fn group_refs(refs: &[RefName]) -> (Vec<RefGroup>, Vec<String>, bool) {
 /// Build VS Code-style pills with colour-coded backgrounds. Every pill uses
 /// dark text on a bright background so contrast is consistently high.
 ///
+/// The previous design used a `☁` glyph for "this branch is on origin", but
+/// in many monospace fonts that character renders thin and washed-out. We
+/// switched to text-sized labels so the chips read at the same visual weight
+/// as the rest of the UI.
+///
 /// - HEAD          → bright green pill `◉ <branch>`
 /// - local branch  → light per-branch coloured pill `⎇ <name>`
-/// - synced (☁)    → adjacent sky-blue chip with the cloud icon
-/// - remote-only   → muted slate pill `☁ origin/<name>`
+/// - synced        → adjacent sky-blue chip with the word `synced`
+/// - remote-only   → muted slate pill `↓ origin/<name>` (down-arrow = "you'd pull this")
 /// - tags          → gold pill `▸ <name>`
 /// - detached HEAD → standalone bright green pill `◉ HEAD`
 fn render_ref_pills(refs: &[RefName], _theme: &Theme) -> Vec<Span<'static>> {
@@ -202,8 +207,9 @@ fn render_ref_pills(refs: &[RefName], _theme: &Theme) -> Vec<Span<'static>> {
                 Style::default().bg(bg).fg(fg).add_modifier(Modifier::BOLD),
             ));
         } else if g.has_remote {
+            // Remote-only branch — chunky text label, ↓ glyph implies "would pull".
             spans.push(Span::styled(
-                format!(" ☁ origin/{} ", g.name),
+                format!(" ↓ origin/{} ", g.name),
                 Style::default()
                     .bg(color::REMOTE_ONLY_BG)
                     .fg(color::REMOTE_ONLY_FG)
@@ -211,11 +217,12 @@ fn render_ref_pills(refs: &[RefName], _theme: &Theme) -> Vec<Span<'static>> {
             ));
         }
 
-        // If both local AND remote, append a tight cloud chip immediately
-        // after the local pill (no gap) — this is the "synced to GitHub" cue.
+        // If both local AND remote, append a `synced` chip immediately after
+        // the local pill (no gap). Using the word so it carries text-weight in
+        // every font instead of relying on the thin `☁` glyph.
         if g.has_local && g.has_remote {
             spans.push(Span::styled(
-                " ☁ ".to_string(),
+                " synced ".to_string(),
                 Style::default()
                     .bg(color::CLOUD_CHIP_BG)
                     .fg(color::CLOUD_CHIP_FG)
