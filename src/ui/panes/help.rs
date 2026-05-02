@@ -105,6 +105,7 @@ fn build_lines(theme: &Theme) -> Vec<Line<'static>> {
         row("a / A", "stage all / unstage all"),
         row("c", "start commit (type message, Enter to commit)"),
         row("C", "commit and push"),
+        row("U", "uncommit HEAD — soft reset, only if not pushed"),
         row("x", "discard local changes — confirms"),
         Line::from(""),
         head("Graph pane"),

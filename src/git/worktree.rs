@@ -1,8 +1,32 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::HashMap, path::{Path, PathBuf}};
 
 use anyhow::Result;
 
 use super::exec;
+
+/// Remove the worktree at `path`. Refuses if the worktree has uncommitted
+/// or unpushed changes — callers should fall back to `remove_force` when
+/// the user has explicitly opted into a destructive flow (e.g. branch-delete
+/// with worktree confirmation).
+pub async fn remove(repo_root: &Path, path: &Path) -> Result<()> {
+    exec::run(
+        repo_root,
+        ["worktree", "remove", &path.to_string_lossy()],
+    )
+    .await?;
+    Ok(())
+}
+
+/// Remove the worktree at `path` even if it has uncommitted changes.
+/// Use only after a user-facing confirmation that discloses this risk.
+pub async fn remove_force(repo_root: &Path, path: &Path) -> Result<()> {
+    exec::run(
+        repo_root,
+        ["worktree", "remove", "--force", &path.to_string_lossy()],
+    )
+    .await?;
+    Ok(())
+}
 
 /// Map of branch name → worktree path. A branch appears in this map when it's
 /// the HEAD of any worktree (including the current one). Use this to detect

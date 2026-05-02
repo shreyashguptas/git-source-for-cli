@@ -150,7 +150,12 @@ pub enum ChangeAction {
     AiMessage,
     StageAll,
     UnstageAll,
+    Uncommit,
     Refresh,
+    /// Preview every uncommitted change in one combined diff. The user can
+    /// still click an individual file row afterwards to drop back into the
+    /// per-file view.
+    ViewAll,
 }
 
 /// Top-level application state.
@@ -197,6 +202,11 @@ pub struct App {
     /// Identity of the thing currently being previewed — sha for commits,
     /// "file:<staged>:<path>" for changes. Used to discard stale fetches.
     pub preview_target: Option<String>,
+    /// True when the preview was set explicitly (e.g. "view all changes"
+    /// button) and shouldn't be overwritten by background status refreshes.
+    /// Cleared the moment the user navigates (selection move, pane switch,
+    /// row click) — i.e. any user-driven `update_preview` call.
+    pub preview_pinned: bool,
 
     pub show_help: bool,
 
@@ -290,6 +300,7 @@ impl App {
             preview: None,
             preview_scroll: 0,
             preview_target: None,
+            preview_pinned: false,
             show_help: false,
             confirm: None,
             gh: Availability::NotInstalled,
@@ -362,13 +373,13 @@ impl App {
                     self.graph_truncated = commits.len() >= MAX_GRAPH_COMMITS;
                     self.commits = commits;
                     self.graph_layout = None;
-                    self.update_preview();
+                    self.refresh_preview_after_reload();
                 }
             }
             AppEvent::StatusLoaded(s) => {
                 clamp_selection(&mut self.changes_state, s.files.len());
                 self.status = s;
-                self.update_preview();
+                self.refresh_preview_after_reload();
             }
             AppEvent::DivergenceLoaded {
                 request_id,
@@ -465,16 +476,59 @@ impl App {
                 }
             }
             AppEvent::OllamaDone(full) => {
-                let cleaned = clean_subject(&full);
-                if self.input.generating {
-                    self.input.generating = false;
-                    self.input.buf = cleaned.clone();
-                    self.input.cursor = self.input.buf.len();
+                let cleaned = clean_message(&full);
+                if cleaned.is_empty() {
+                    // Empty cleaned-subject = the model returned nothing
+                    // usable. Most common reasons:
+                    //   - user picked an embedding model (no `response` field)
+                    //   - model emitted only a `<think>` block with no answer
+                    //   - model genuinely returned an empty completion
+                    // Showing an empty "ready" modal would hide all of these.
+                    // Fail loudly via the same modal so retry / model-pick are
+                    // one keystroke away.
+                    let preview: String = full.trim().chars().take(160).collect();
+                    let model_name = self
+                        .generation
+                        .as_ref()
+                        .map(|g| g.model.clone())
+                        .unwrap_or_else(|| "model".to_string());
+                    let msg = if preview.is_empty() {
+                        format!(
+                            "{model_name} returned no text — likely an embedding model that can't generate prose. \
+                             Press r to retry or Esc to dismiss; the model stays as-is."
+                        )
+                    } else {
+                        format!(
+                            "{model_name} returned only reasoning content — no usable subject line was extracted. \
+                             Press r to retry. Raw start: {preview}…"
+                        )
+                    };
+                    if self.input.generating || self.input_mode == InputMode::Commit {
+                        self.input.clear();
+                        self.input_mode = InputMode::Normal;
+                    }
+                    if let Some(g) = self.generation.as_mut() {
+                        g.finish_error(msg);
+                    } else {
+                        self.toast = Some(msg);
+                    }
+                    self.gen_task = None;
+                } else {
+                    if self.input.generating {
+                        self.input.generating = false;
+                        self.input.buf = cleaned.clone();
+                        // Park the cursor at the end of the subject line, not
+                        // the end of the body. The inline input bar is one
+                        // row, so this is where the user can actually see and
+                        // edit; the body is committed but isn't part of the
+                        // inline preview.
+                        self.input.cursor = cleaned.find('\n').unwrap_or(cleaned.len());
+                    }
+                    if let Some(g) = self.generation.as_mut() {
+                        g.finish_done(cleaned);
+                    }
+                    self.gen_task = None;
                 }
-                if let Some(g) = self.generation.as_mut() {
-                    g.finish_done(cleaned);
-                }
-                self.gen_task = None;
             }
             AppEvent::OllamaError(msg) => {
                 // Surface the error in the generation modal (so it's loud,
@@ -711,6 +765,9 @@ impl App {
                 self.input.clear();
                 self.input.push_after = true;
             }
+            KeyCode::Char('U') if self.active_pane == Pane::Changes => {
+                self.start_uncommit_flow().await;
+            }
             KeyCode::Char('x') if self.active_pane == Pane::Changes => {
                 if let Some(idx) = self.changes_state.selected() {
                     if let Some(file) = self.status.files.get(idx) {
@@ -866,8 +923,14 @@ impl App {
             return;
         }
 
-        // Don't redirect mouse while typing a commit message.
-        if self.input_mode == InputMode::Commit {
+        // Block the mouse only while the AI is actively streaming tokens —
+        // the screen would race the live text otherwise. Once the stream
+        // ends (success, error, or cancel) we want the user to be able to
+        // click ✓ commit, scroll the diff, drag a splitter, etc., without
+        // having to first dismiss commit-input mode. Pane-content clicks
+        // are still safe here: they change selection but never the input
+        // buffer.
+        if self.input.generating {
             return;
         }
 
@@ -1241,13 +1304,32 @@ impl App {
                 }),
             ),
             ChangeAction::Commit => {
-                self.input_mode = InputMode::Commit;
-                self.input.clear();
+                // If we're already in commit mode with a ready message
+                // (e.g. just generated by AI, or manually typed), treat
+                // the click as "submit" instead of wiping the buffer and
+                // opening an empty input.
+                if self.input_mode == InputMode::Commit
+                    && !self.input.generating
+                    && !self.input.buf.trim().is_empty()
+                {
+                    self.do_commit().await;
+                } else {
+                    self.input_mode = InputMode::Commit;
+                    self.input.clear();
+                }
             }
             ChangeAction::CommitAndPush => {
-                self.input_mode = InputMode::Commit;
-                self.input.clear();
-                self.input.push_after = true;
+                if self.input_mode == InputMode::Commit
+                    && !self.input.generating
+                    && !self.input.buf.trim().is_empty()
+                {
+                    self.input.push_after = true;
+                    self.do_commit().await;
+                } else {
+                    self.input_mode = InputMode::Commit;
+                    self.input.clear();
+                    self.input.push_after = true;
+                }
             }
             ChangeAction::AiMessage => {
                 // Drop into commit-input mode (so the streamed message has
@@ -1257,8 +1339,61 @@ impl App {
                     self.start_generation().await;
                 }
             }
+            ChangeAction::Uncommit => self.start_uncommit_flow().await,
             ChangeAction::Refresh => self.spawn_refresh(),
+            ChangeAction::ViewAll => self.show_all_changes_preview(),
         }
+    }
+
+    /// Open the uncommit confirmation dialog if it's safe — i.e. HEAD is on a
+    /// branch, has a parent commit, and the commit hasn't been pushed yet
+    /// (otherwise rewriting HEAD locally would create divergence). Each guard
+    /// surfaces a specific toast so the user knows why it was blocked.
+    async fn start_uncommit_flow(&mut self) {
+        let branch = match &self.head {
+            HeadRef::Branch(b) => b.clone(),
+            HeadRef::Detached(_) => {
+                self.toast = Some("HEAD is detached — uncommit blocked".to_string());
+                return;
+            }
+            HeadRef::Unborn => {
+                self.toast = Some("repo has no commits yet".to_string());
+                return;
+            }
+        };
+        // If the branch has an upstream and is not ahead of it, the HEAD
+        // commit was already pushed — uncommitting would create divergence.
+        if let Some(b) = self.branches.iter().find(|b| b.name == branch) {
+            if b.upstream.is_some() && b.ahead == 0 {
+                self.toast = Some(format!(
+                    "'{branch}' is in sync with upstream — uncommit would force-push later, blocked"
+                ));
+                return;
+            }
+        }
+        let summary = match git::ops::head_summary(&self.repo.root).await {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                self.toast = Some("no HEAD commit to uncommit".to_string());
+                return;
+            }
+            Err(e) => {
+                self.toast = Some(format!("uncommit preflight: {e}"));
+                return;
+            }
+        };
+        if !summary.has_parent {
+            self.toast = Some("HEAD is the root commit — cannot uncommit".to_string());
+            return;
+        }
+        self.confirm = Some(ConfirmDialog {
+            title: "uncommit".to_string(),
+            message: format!(
+                "Uncommit '{}' ({})? Changes return to the staging area — reversible via reflog.",
+                summary.subject, summary.short
+            ),
+            action: ConfirmAction::Uncommit,
+        });
     }
 
     /// Push current branch — if no upstream, push -u.
@@ -1306,39 +1441,33 @@ impl App {
             );
             return;
         }
-        // Pre-flight: branches that are checked out in *another* worktree
-        // can't be deleted by git either — surface the reason loudly so the
-        // user knows what to do (remove the worktree first).
-        if let Some(wt_path) = self.worktrees.get(&b.name).cloned() {
-            self.info_dialog = Some(
-                InfoDialog::error(
-                    "Cannot delete worktree branch",
-                    format!(
-                        "'{}' is checked out at the worktree:\n  {}\n\nGit refuses to delete a \
-                         branch that's checked out anywhere — including another worktree.",
-                        b.name,
-                        wt_path.display()
-                    ),
-                )
-                .with_hint(format!(
-                    "Remove the worktree first with `git worktree remove \"{}\"`, then retry the delete here.",
-                    wt_path.display()
-                )),
-            );
-            return;
-        }
-        let title = if force {
-            "Force-delete branch"
-        } else {
-            "Delete branch"
+        // If the branch is checked out in another worktree, we have to
+        // `git worktree remove` it before `git branch -d` will succeed.
+        // Bake that into the confirm flow so a single Yes does both.
+        let worktree = self.worktrees.get(&b.name).cloned();
+        let title = match (force, worktree.is_some()) {
+            (true, _) => "Force-delete branch",
+            (false, true) => "Delete branch and worktree",
+            (false, false) => "Delete branch",
         };
-        let message = if force {
-            format!(
+        let message = match (force, &worktree) {
+            (true, Some(p)) => format!(
+                "Force-delete branch '{}' (loses unmerged commits) AND remove the worktree at {}? \
+                 If the worktree has uncommitted changes they will be discarded.",
+                b.name,
+                p.display()
+            ),
+            (true, None) => format!(
                 "Force-delete branch '{}' (loses unmerged commits)?",
                 b.name
-            )
-        } else {
-            format!("Delete branch '{}'?", b.name)
+            ),
+            (false, Some(p)) => format!(
+                "Delete branch '{}' AND remove the worktree at {}? If the worktree has \
+                 uncommitted changes they will be discarded.",
+                b.name,
+                p.display()
+            ),
+            (false, None) => format!("Delete branch '{}'?", b.name),
         };
         self.confirm = Some(ConfirmDialog {
             title: title.to_string(),
@@ -1346,6 +1475,7 @@ impl App {
             action: ConfirmAction::DeleteBranch {
                 name: b.name.clone(),
                 force,
+                worktree,
             },
         });
     }
@@ -1391,13 +1521,28 @@ impl App {
     async fn run_confirmed_action(&mut self, action: ConfirmAction) {
         let root = self.repo.root.clone();
         match action {
-            ConfirmAction::DeleteBranch { name, force } => {
+            ConfirmAction::DeleteBranch {
+                name,
+                force,
+                worktree,
+            } => {
                 let label = format!("delete {name}");
-                let op: BoxedOp = if force {
-                    Box::pin(async move { git::ops::force_delete_branch(&root, &name).await })
-                } else {
-                    Box::pin(async move { git::ops::delete_branch(&root, &name).await })
-                };
+                let op: BoxedOp = Box::pin(async move {
+                    // Worktree first — `git branch -d/-D` refuses while a
+                    // branch is checked out anywhere. Try clean remove, then
+                    // force-fallback (the user already opted into destruction
+                    // by typing `y` on the confirm dialog).
+                    if let Some(path) = worktree {
+                        if git::worktree::remove(&root, &path).await.is_err() {
+                            git::worktree::remove_force(&root, &path).await?;
+                        }
+                    }
+                    if force {
+                        git::ops::force_delete_branch(&root, &name).await
+                    } else {
+                        git::ops::delete_branch(&root, &name).await
+                    }
+                });
                 self.run_op_async(&label, op);
             }
             ConfirmAction::DiscardFile { path } => {
@@ -1414,6 +1559,10 @@ impl App {
                         .map(|_| format!("merged {name}"))
                 });
                 self.run_op_async(&label, op);
+            }
+            ConfirmAction::Uncommit => {
+                let op: BoxedOp = Box::pin(async move { git::ops::uncommit_soft(&root).await });
+                self.run_op_async("uncommit", op);
             }
         }
     }
@@ -2102,7 +2251,12 @@ impl App {
 
     /// Inspect the current pane+selection and update the inline preview if the
     /// target changed. Cheap when target is the same (no fetch spawned).
+    ///
+    /// Called from user-driven sites (selection moves, pane switches, mouse
+    /// clicks) — it always unpins so navigation drops the user back into the
+    /// per-selection preview after a "view all" pin.
     fn update_preview(&mut self) {
+        self.preview_pinned = false;
         let request = self.current_preview_request();
         match request {
             None => {
@@ -2134,6 +2288,48 @@ impl App {
                 });
             }
         }
+    }
+
+    /// Background-event variant — used after async refreshes (status/commits
+    /// reload) so a pinned preview (e.g. "view all changes") survives.
+    fn refresh_preview_after_reload(&mut self) {
+        if !self.preview_pinned {
+            self.update_preview();
+        }
+    }
+
+    /// Build the combined diff body for "view all changes" and pin it as the
+    /// preview. Selection moves / pane switches / row clicks unpin
+    /// automatically via `update_preview`.
+    fn show_all_changes_preview(&mut self) {
+        let total = self.status.files.len();
+        let title = format!("All changes ({total} files)");
+        let target = format!("all-changes:{}", self.repo.root.display());
+
+        self.preview_target = Some(target.clone());
+        self.preview = Some(DetailsContent::Loading { title: title.clone() });
+        self.preview_scroll = 0;
+        self.preview_pinned = true;
+
+        let untracked: Vec<String> = self
+            .status
+            .files
+            .iter()
+            .filter(|f| matches!(f.kind, ChangeKind::Untracked))
+            .map(|f| f.path.clone())
+            .collect();
+        let root = self.repo.root.clone();
+        let tx = self.events_tx.clone();
+        tokio::spawn(async move {
+            let content = match git::diff::all_changes(&root, &untracked).await {
+                Ok(body) => DetailsContent::Body { title, body },
+                Err(e) => DetailsContent::Error {
+                    title,
+                    message: format!("{e}"),
+                },
+            };
+            let _ = tx.send(AppEvent::PreviewLoaded(target, content)).await;
+        });
     }
 
     fn refresh_graph_for_selected_branch(&mut self) {
@@ -2430,13 +2626,14 @@ fn github_web_url(remote: &str) -> Option<String> {
     None
 }
 
-/// Cap a staged diff before sending to Ollama. Most local models choke on
-/// 100k-token inputs and the commit subject is determined by the high-level
-/// file/hunk structure anyway, so chopping at ~8k lines / 32 KB is a sane
-/// budget. The boolean signals whether truncation actually happened so the
-/// prompt can disclose that.
-const MAX_DIFF_LINES: usize = 8000;
-const MAX_DIFF_BYTES: usize = 32 * 1024;
+/// Cap a staged diff before sending to Ollama. Sized to fit comfortably
+/// inside the 32K context window we configure for the model (see
+/// `ollama::client`), with headroom for the system prompt, the recent-
+/// subject style block, and a multi-paragraph generated body. The boolean
+/// signals whether truncation actually happened so the prompt can disclose
+/// it; in practice almost no real-world diff hits this.
+const MAX_DIFF_LINES: usize = 32_000;
+const MAX_DIFF_BYTES: usize = 96 * 1024;
 
 fn truncate_diff(diff: &str) -> (String, bool) {
     let mut out = String::new();
@@ -2452,23 +2649,82 @@ fn truncate_diff(diff: &str) -> (String, bool) {
     (out, truncated)
 }
 
-/// Coerce the raw streamed model output into a single commit subject line:
-/// take the first non-empty line, strip stray quotes some models add, and cap
-/// the length defensively.
-fn clean_subject(raw: &str) -> String {
-    let line = raw
-        .lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty())
-        .unwrap_or("")
-        .trim_matches(|c: char| c == '"' || c == '\'' || c == '`')
-        .trim()
-        .to_string();
-    if line.chars().count() > 200 {
-        line.chars().take(200).collect()
-    } else {
-        line
+/// Coerce the raw streamed model output into a clean commit message
+/// (subject + optional body, separated by a blank line). Strips reasoning
+/// blocks and outer code fences, normalizes line endings. No length cap —
+/// we trust the prompt; truncating mid-sentence is worse than a long commit.
+fn clean_message(raw: &str) -> String {
+    // 1. Strip reasoning blocks some models emit (Gemma-Thinking,
+    //    Qwen-Reasoning, DeepSeek-R1, ...). The answer lives outside.
+    let stripped = strip_thinking_blocks(raw).replace("\r\n", "\n");
+
+    // 2. Drop pure code-fence lines from the start and end. Some models wrap
+    //    the whole answer in ```...``` even when asked not to.
+    let lines: Vec<&str> = stripped.lines().collect();
+    let mut start = 0usize;
+    let mut end = lines.len();
+    while start < end && (lines[start].trim().is_empty() || is_fence_line(lines[start])) {
+        start += 1;
     }
+    while end > start && (lines[end - 1].trim().is_empty() || is_fence_line(lines[end - 1])) {
+        end -= 1;
+    }
+    let body = lines[start..end].join("\n");
+
+    // 3. If single-line, also strip surrounding quote/backtick characters
+    //    that some models still add ("feat: x" → feat: x).
+    if !body.contains('\n') {
+        body.trim_matches(|c: char| c == '"' || c == '\'' || c == '`')
+            .trim()
+            .to_string()
+    } else {
+        body
+    }
+}
+
+/// True for lines that are nothing but a code-fence marker (``` or ```rust).
+fn is_fence_line(line: &str) -> bool {
+    let t = line.trim();
+    if !t.starts_with("```") {
+        return false;
+    }
+    // After the leading ```, only an optional language tag (alphanumerics).
+    t[3..].chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Drop `<think>…</think>` and `<thinking>…</thinking>` regions (case-
+/// insensitive). Unclosed openers drop the rest — anything past an unclosed
+/// tag is incomplete reasoning and not a usable answer.
+fn strip_thinking_blocks(raw: &str) -> String {
+    const TAGS: &[(&str, &str)] = &[("<think>", "</think>"), ("<thinking>", "</thinking>")];
+    let lower = raw.to_ascii_lowercase();
+    let mut out = String::with_capacity(raw.len());
+    let mut cursor = 0usize;
+
+    loop {
+        // Earliest opener wins, regardless of which tag flavour.
+        let next = TAGS
+            .iter()
+            .filter_map(|(open, close)| {
+                lower[cursor..]
+                    .find(open)
+                    .map(|p| (cursor + p, *open, *close))
+            })
+            .min_by_key(|(p, _, _)| *p);
+
+        let Some((open_idx, open_tag, close_tag)) = next else {
+            out.push_str(&raw[cursor..]);
+            break;
+        };
+        out.push_str(&raw[cursor..open_idx]);
+
+        let after_open = open_idx + open_tag.len();
+        match lower[after_open..].find(close_tag) {
+            Some(close) => cursor = after_open + close + close_tag.len(),
+            None => return out,
+        }
+    }
+    out
 }
 
 fn clamp_selection(state: &mut ListState, len: usize) {
@@ -2512,4 +2768,93 @@ pub async fn launch(
     let _ = crate::watcher::spawn(&repo.root, tx);
 
     app.run(terminal, rx).await
+}
+
+#[cfg(test)]
+mod clean_message_tests {
+    use super::{clean_message, strip_thinking_blocks};
+
+    #[test]
+    fn keeps_simple_subject() {
+        assert_eq!(
+            clean_message("feat: add view-all toolbar button"),
+            "feat: add view-all toolbar button"
+        );
+    }
+
+    #[test]
+    fn strips_surrounding_quotes_on_single_line() {
+        assert_eq!(clean_message("\"feat: x\""), "feat: x");
+        assert_eq!(clean_message("`fix: y`"), "fix: y");
+    }
+
+    #[test]
+    fn ignores_leading_blank_lines() {
+        assert_eq!(clean_message("\n\n   \nfeat: hello\n"), "feat: hello");
+    }
+
+    #[test]
+    fn strips_outer_code_fences() {
+        let raw = "```\nfeat: wrapped in fence\n```";
+        assert_eq!(clean_message(raw), "feat: wrapped in fence");
+    }
+
+    #[test]
+    fn strips_outer_language_tagged_fences() {
+        let raw = "```text\nfeat: subject\n\nbody line\n```";
+        assert_eq!(clean_message(raw), "feat: subject\n\nbody line");
+    }
+
+    #[test]
+    fn preserves_subject_blank_body_structure() {
+        let raw = "feat: add view-all\n\nAdds a button that shows the combined diff.\nPer-file drill-down still works via row clicks.";
+        assert_eq!(
+            clean_message(raw),
+            "feat: add view-all\n\nAdds a button that shows the combined diff.\nPer-file drill-down still works via row clicks."
+        );
+    }
+
+    #[test]
+    fn drops_think_block_and_keeps_following_message() {
+        let raw = "<think>\nThe diff adds a toolbar button.\n</think>\nfeat: add toolbar button\n\nLets the user see all uncommitted diffs at once.";
+        assert_eq!(
+            clean_message(raw),
+            "feat: add toolbar button\n\nLets the user see all uncommitted diffs at once."
+        );
+    }
+
+    #[test]
+    fn returns_empty_when_only_thinking() {
+        let raw = "<think>\nplanning planning planning\n</think>\n";
+        assert_eq!(clean_message(raw), "");
+    }
+
+    #[test]
+    fn returns_empty_when_unclosed_thinking_block() {
+        let raw = "<think>\nstill reasoning…";
+        assert_eq!(clean_message(raw), "");
+    }
+
+    #[test]
+    fn case_insensitive_thinking_tags() {
+        let raw = "<Thinking>plan</Thinking>\nfeat: keep working";
+        assert_eq!(clean_message(raw), "feat: keep working");
+    }
+
+    #[test]
+    fn strip_thinking_blocks_handles_mixed_content() {
+        let raw = "before <think>x</think> middle <thinking>y</thinking> after";
+        assert_eq!(strip_thinking_blocks(raw), "before  middle  after");
+    }
+
+    #[test]
+    fn does_not_strip_quotes_on_multiline() {
+        // Multi-line messages with intentional quotes inside the body should
+        // not be quote-stripped — only single-line subjects get that treatment.
+        let raw = "\"feat: subject\"\n\nbody mentions \"a quoted phrase\" inside.";
+        assert_eq!(
+            clean_message(raw),
+            "\"feat: subject\"\n\nbody mentions \"a quoted phrase\" inside."
+        );
+    }
 }

@@ -12,7 +12,12 @@ use ratatui::{
     Frame,
 };
 
-use crate::{git::diff::{classify, DiffLineKind}, ui::theme::Theme};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+use crate::{
+    git::diff::{classify, DiffLineKind},
+    ui::{file_icon::file_icon, theme::Theme},
+};
 
 /// What's being shown in the overlay (or preview pane).
 #[derive(Debug, Clone)]
@@ -117,7 +122,7 @@ fn render_body<'a>(body: &'a str, theme: &Theme, width: u16) -> Vec<Line<'a>> {
     let mut max_num: u32 = 0;
     for line in body.lines() {
         if line.starts_with("@@") {
-            if let Some((o_start, o_len, n_start, n_len)) = parse_hunk(line) {
+            if let Some((o_start, o_len, n_start, n_len, _ctx)) = parse_hunk_full(line) {
                 max_num = max_num
                     .max(o_start.saturating_add(o_len))
                     .max(n_start.saturating_add(n_len));
@@ -175,7 +180,7 @@ fn render_body<'a>(body: &'a str, theme: &Theme, width: u16) -> Vec<Line<'a>> {
         }
 
         if line.starts_with("@@") {
-            if let Some((o_start, _o_len, n_start, _n_len)) = parse_hunk(line) {
+            if let Some((o_start, _o_len, n_start, _n_len, _ctx)) = parse_hunk_full(line) {
                 old_no = o_start;
                 new_no = n_start;
             }
@@ -187,7 +192,7 @@ fn render_body<'a>(body: &'a str, theme: &Theme, width: u16) -> Vec<Line<'a>> {
             let kind = classify(line);
             match kind {
                 DiffLineKind::Context => {
-                    out.push(diff_row(
+                    out.extend(diff_rows(
                         line,
                         kind,
                         Some(old_no),
@@ -200,7 +205,7 @@ fn render_body<'a>(body: &'a str, theme: &Theme, width: u16) -> Vec<Line<'a>> {
                     new_no = new_no.saturating_add(1);
                 }
                 DiffLineKind::Add => {
-                    out.push(diff_row(
+                    out.extend(diff_rows(
                         line,
                         kind,
                         None,
@@ -212,7 +217,7 @@ fn render_body<'a>(body: &'a str, theme: &Theme, width: u16) -> Vec<Line<'a>> {
                     new_no = new_no.saturating_add(1);
                 }
                 DiffLineKind::Del => {
-                    out.push(diff_row(
+                    out.extend(diff_rows(
                         line,
                         kind,
                         Some(old_no),
@@ -242,20 +247,23 @@ fn render_body<'a>(body: &'a str, theme: &Theme, width: u16) -> Vec<Line<'a>> {
     out
 }
 
-/// Render a file separator bar — bold filename + dim parent directory on a
-/// muted background, padded across the full width.
+/// Render a file separator bar — language icon + bold filename + dim parent
+/// directory on a muted background, padded across the full width.
 fn file_header_bar<'a>(path: &'a str, theme: &Theme, width: u16) -> Line<'a> {
     let bar_bg = theme.selection_bg_inactive;
     let (parent, name) = match path.rsplit_once('/') {
         Some((p, n)) => (p, n),
         None => ("", path),
     };
+    // Pull the language icon + brand color from the shared mapping that the
+    // Changes pane file rows use, so the diff header matches them visually.
+    let (icon, icon_style) = file_icon(path, theme);
+    let icon_style = icon_style.bg(bar_bg);
 
-    let mut spans: Vec<Span<'a>> = Vec::with_capacity(5);
-    spans.push(Span::styled(
-        " ",
-        Style::default().bg(bar_bg),
-    ));
+    let mut spans: Vec<Span<'a>> = Vec::with_capacity(7);
+    spans.push(Span::styled(" ", Style::default().bg(bar_bg)));
+    spans.push(Span::styled(icon, icon_style));
+    spans.push(Span::styled("  ", Style::default().bg(bar_bg)));
     spans.push(Span::styled(
         name.to_string(),
         Style::default()
@@ -264,16 +272,15 @@ fn file_header_bar<'a>(path: &'a str, theme: &Theme, width: u16) -> Line<'a> {
             .add_modifier(Modifier::BOLD),
     ));
     if !parent.is_empty() {
-        spans.push(Span::styled(
-            "  ",
-            Style::default().bg(bar_bg),
-        ));
+        spans.push(Span::styled("  ", Style::default().bg(bar_bg)));
         spans.push(Span::styled(
             parent.to_string(),
             Style::default().fg(theme.fg_dim).bg(bar_bg),
         ));
     }
-    let used = 1 + name.chars().count() + if parent.is_empty() { 0 } else { 2 + parent.chars().count() };
+    // Display-width-correct padding so the bar fills the row even when the
+    // path contains wide glyphs.
+    let used: usize = spans.iter().map(|s| s.content.as_ref().width()).sum();
     if (width as usize) > used {
         spans.push(Span::styled(
             " ".repeat(width as usize - used),
@@ -283,21 +290,42 @@ fn file_header_bar<'a>(path: &'a str, theme: &Theme, width: u16) -> Line<'a> {
     Line::from(spans)
 }
 
-/// Hunk header — pass through the raw `@@ -X,Y +A,B @@ context` line with the
-/// hunk style, indented past the gutter so it lines up under the file bar.
+/// Hunk header — replace the cryptic `@@ -X,Y +A,B @@` with a human-friendly
+/// `Line N · context` (the N matches the gutter's NEW-side number, and the
+/// context is the trailing function/scope hint git already emits).
 fn hunk_line<'a>(line: &'a str, theme: &Theme, gutter_chars: u16) -> Line<'a> {
-    let style = line_style(DiffLineKind::Hunk, theme);
-    Line::from(vec![
-        Span::raw(" ".repeat(gutter_chars as usize)),
-        Span::styled(line, style),
-    ])
+    let label_style = Style::default()
+        .fg(theme.accent)
+        .add_modifier(Modifier::BOLD);
+    let context_style = Style::default()
+        .fg(theme.fg_dim)
+        .add_modifier(Modifier::ITALIC);
+
+    let (label, context) = match parse_hunk_full(line) {
+        Some((_, _, ns, _, ctx)) => (format!("Line {ns}"), ctx.to_string()),
+        // Couldn't parse — fall back to the raw line so we don't lose info.
+        None => (line.to_string(), String::new()),
+    };
+
+    let mut spans = Vec::with_capacity(4);
+    spans.push(Span::raw(" ".repeat(gutter_chars as usize)));
+    spans.push(Span::styled(label, label_style));
+    if !context.is_empty() {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(context, context_style));
+    }
+    Line::from(spans)
 }
 
-/// One diff content row with a two-column line-number gutter.
-/// `old_n` / `new_n` are `None` for the column that doesn't apply (None on the
-/// old side for additions, None on the new side for deletions). For add/del
-/// rows the content area is padded out to `width` so the bg highlight fills.
-fn diff_row<'a>(
+/// One diff content row with a two-column line-number gutter, manually wrapped
+/// so the gutter stays aligned even when content overflows the pane width.
+///
+/// Without this, ratatui's `Wrap` would break the content at column 0 of the
+/// next visual row — the wrapped text bleeds past the gutter and the bg color
+/// from the previous row carries through to spaces it shouldn't. By emitting
+/// one `Line` per chunk (each exactly `width` cells, including padding) we
+/// guarantee the wrapper never has to wrap us.
+fn diff_rows<'a>(
     line: &'a str,
     kind: DiffLineKind,
     old_n: Option<u32>,
@@ -305,7 +333,7 @@ fn diff_row<'a>(
     digits: u16,
     theme: &Theme,
     width: u16,
-) -> Line<'a> {
+) -> Vec<Line<'a>> {
     let style = line_style(kind, theme);
     let gutter_style = Style::default().fg(theme.fg_dim);
     let d = digits as usize;
@@ -318,22 +346,80 @@ fn diff_row<'a>(
         Some(n) => format!("{:>w$} ", n, w = d),
         None => " ".repeat(d + 1),
     };
+    let gutter_chars = (digits * 2 + 3) as usize;
+    let blank_gutter = " ".repeat(gutter_chars);
 
-    let mut spans: Vec<Span<'a>> = Vec::with_capacity(4);
-    spans.push(Span::styled(old_str, gutter_style));
-    spans.push(Span::styled(new_str, gutter_style));
-    spans.push(Span::styled(line, style));
+    let content_w = (width as usize).saturating_sub(gutter_chars);
+    let needs_pad = matches!(kind, DiffLineKind::Add | DiffLineKind::Del);
 
-    // Pad add/del rows so the bg highlight covers the rest of the content area.
-    if matches!(kind, DiffLineKind::Add | DiffLineKind::Del) && width > 0 {
-        let gutter_chars = digits * 2 + 3;
-        let content_w = (width as usize).saturating_sub(gutter_chars as usize);
-        let len = line.chars().count();
-        if len < content_w {
-            spans.push(Span::styled(" ".repeat(content_w - len), style));
-        }
+    // Degenerate widths: emit a single row so we never return zero lines and
+    // never panic on subtraction.
+    if width == 0 || content_w == 0 {
+        return vec![Line::from(vec![
+            Span::styled(old_str, gutter_style),
+            Span::styled(new_str, gutter_style),
+            Span::styled(line, style),
+        ])];
     }
-    Line::from(spans)
+
+    let chunks = split_by_display_width(line, content_w);
+    let mut out: Vec<Line<'a>> = Vec::with_capacity(chunks.len().max(1));
+    for (i, chunk) in chunks.iter().enumerate() {
+        let mut spans: Vec<Span<'a>> = Vec::with_capacity(4);
+        if i == 0 {
+            spans.push(Span::styled(old_str.clone(), gutter_style));
+            spans.push(Span::styled(new_str.clone(), gutter_style));
+        } else {
+            // Continuation rows: blank gutter so the content under add/del
+            // bars stays aligned with the first chunk.
+            spans.push(Span::styled(blank_gutter.clone(), gutter_style));
+        }
+        spans.push(Span::styled(chunk.clone(), style));
+        if needs_pad {
+            let cw = chunk.width();
+            if cw < content_w {
+                spans.push(Span::styled(" ".repeat(content_w - cw), style));
+            }
+        }
+        out.push(Line::from(spans));
+    }
+    if out.is_empty() {
+        // Empty diff line (rare — usually a `+` with no content). Still emit
+        // a row so the gutter line numbers are present.
+        let mut spans: Vec<Span<'a>> = vec![
+            Span::styled(old_str, gutter_style),
+            Span::styled(new_str, gutter_style),
+        ];
+        if needs_pad {
+            spans.push(Span::styled(" ".repeat(content_w), style));
+        }
+        out.push(Line::from(spans));
+    }
+    out
+}
+
+/// Split a string into pieces whose display width is ≤ `max_w`. Used to
+/// pre-wrap diff content so ratatui's `Wrap` never has to.
+fn split_by_display_width(s: &str, max_w: usize) -> Vec<String> {
+    if max_w == 0 {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut cur_w = 0usize;
+    for ch in s.chars() {
+        let cw = ch.width().unwrap_or(0);
+        if cur_w + cw > max_w && !current.is_empty() {
+            out.push(std::mem::take(&mut current));
+            cur_w = 0;
+        }
+        current.push(ch);
+        cur_w += cw;
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
 }
 
 /// Pre-diff lines (commit headers, --stat block) — same classification as
@@ -354,20 +440,22 @@ fn parse_diff_git_path(rest: &str) -> &str {
     rest.trim_end()
 }
 
-/// Parse a hunk header and return `(old_start, old_len, new_start, new_len)`.
-/// Accepts both `@@ -X,Y +A,B @@` and `@@ -X +A @@` (length defaults to 1).
-fn parse_hunk(line: &str) -> Option<(u32, u32, u32, u32)> {
-    // Strip leading "@@ "
+/// Parse a hunk header and return `(old_start, old_len, new_start, new_len,
+/// trailing_context)`. Accepts both `@@ -X,Y +A,B @@` and `@@ -X +A @@`
+/// (length defaults to 1). The trailing context is the function/scope hint
+/// git emits after the second `@@` — we surface it in the friendly hunk
+/// label.
+fn parse_hunk_full(line: &str) -> Option<(u32, u32, u32, u32, &str)> {
     let rest = line.strip_prefix("@@")?.trim_start();
-    // Split off the trailing "@@ ..." — only keep the ranges section.
     let close = rest.find("@@")?;
     let ranges = rest[..close].trim();
+    let context = rest[close + 2..].trim();
     let mut parts = ranges.split_whitespace();
     let old = parts.next()?.strip_prefix('-')?;
     let new = parts.next()?.strip_prefix('+')?;
     let (os, ol) = split_range(old);
     let (ns, nl) = split_range(new);
-    Some((os, ol, ns, nl))
+    Some((os, ol, ns, nl, context))
 }
 
 fn split_range(s: &str) -> (u32, u32) {
@@ -428,10 +516,23 @@ mod tests {
 
     #[test]
     fn parses_hunk_headers() {
-        assert_eq!(parse_hunk("@@ -1,3 +1,4 @@"), Some((1, 3, 1, 4)));
-        assert_eq!(parse_hunk("@@ -10,0 +11,5 @@ context"), Some((10, 0, 11, 5)));
-        assert_eq!(parse_hunk("@@ -1 +1 @@"), Some((1, 1, 1, 1)));
-        assert_eq!(parse_hunk("not a hunk"), None);
+        assert_eq!(
+            parse_hunk_full("@@ -1,3 +1,4 @@"),
+            Some((1, 3, 1, 4, ""))
+        );
+        assert_eq!(
+            parse_hunk_full("@@ -10,0 +11,5 @@ fn foo()"),
+            Some((10, 0, 11, 5, "fn foo()"))
+        );
+        assert_eq!(parse_hunk_full("@@ -1 +1 @@"), Some((1, 1, 1, 1, "")));
+        assert_eq!(parse_hunk_full("not a hunk"), None);
+    }
+
+    #[test]
+    fn splits_by_display_width_keeps_chunks_under_limit() {
+        let chunks = split_by_display_width("abcdefghij", 4);
+        assert_eq!(chunks, vec!["abcd", "efgh", "ij"]);
+        assert!(split_by_display_width("", 4).is_empty());
     }
 
     #[test]

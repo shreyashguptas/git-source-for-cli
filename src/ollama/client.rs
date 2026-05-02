@@ -79,10 +79,25 @@ pub async fn generate_stream(
         "system": system,
         "prompt": prompt,
         "stream": true,
-        // Bias the model toward concise, low-temp output. num_predict caps the
-        // worst case so a runaway model can't generate forever.
+        // Disable thinking on models that support it (Gemma 4, Qwen 3, etc.).
+        // When `think` defaults to true, the model spends its num_predict
+        // budget emitting reasoning into a separate `thinking` field, leaving
+        // `response` empty — the modal then shows "no text". For a one-line
+        // commit subject we want the answer directly. Older models that don't
+        // support `think` ignore the field, so this is safe everywhere.
+        "think": false,
+        // No length cap on the model's output. `num_predict: -1` lifts the
+        // predict-count cap, and `num_ctx: 32768` lifts Ollama's default 4K
+        // context window so the model has room for the diff, the recent-
+        // subject style block, the system prompt, AND a multi-paragraph
+        // body. Without num_ctx, long inputs leave so little room that the
+        // model stops mid-sentence and the commit message looks truncated.
+        // 32K is supported by every modern small model (Gemma 4, Qwen 3,
+        // Llama 3.2, etc.) and Ollama silently clamps to the model's max
+        // when smaller, so this is safe across the board.
         "options": {
-            "num_predict": 256,
+            "num_predict": -1,
+            "num_ctx": 32768,
             "temperature": 0.2,
         },
         // Unload the model from memory immediately after this request

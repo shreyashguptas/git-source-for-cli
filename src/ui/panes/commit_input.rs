@@ -105,28 +105,60 @@ pub fn render(state: &InputState, area: Rect, frame: &mut Frame, theme: &Theme) 
         .bg(theme.selection_bg(true))
         .fg(theme.fg);
 
-    // Compose: label + buffer + cursor caret + hint
+    // The inline bar is one row tall, so when the buffer carries an AI-
+    // generated body (subject\n\nbody) we render only the subject and
+    // append a "(+N body lines)" hint. The body is committed; it just
+    // doesn't fit in the bar. Cursor stays inside the subject portion
+    // (parked there by OllamaDone) so backspace/insert behave intuitively.
+    let subject_end = state.buf.find('\n').unwrap_or(state.buf.len());
+    let subject = &state.buf[..subject_end];
+    let body_lines: usize = if subject_end == state.buf.len() {
+        0
+    } else {
+        // Count non-empty body lines after the blank-line separator.
+        state.buf[subject_end..]
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count()
+    };
+    let cursor_in_subject = state.cursor.min(subject.len());
+
     let body_with_caret = if state.generating {
         // Animated-ish caret to signal "writing now".
-        format!(" {}▌ ", state.buf)
-    } else if state.cursor == state.buf.len() {
-        format!(" {} ▏ ", state.buf)
+        format!(" {subject}▌ ")
+    } else if cursor_in_subject == subject.len() {
+        format!(" {subject} ▏ ")
     } else {
-        format!(" {}▏{} ", &state.buf[..state.cursor], &state.buf[state.cursor..])
+        format!(
+            " {}▏{} ",
+            &subject[..cursor_in_subject],
+            &subject[cursor_in_subject..]
+        )
     };
 
-    // Render the label and body as two paragraphs side by side.
+    // Render the label and body as paragraphs side by side, with an optional
+    // "+N body lines" tail chip on the right.
     let prompt_w = prompt.chars().count() as u16;
+    let hint = if body_lines > 0 && !state.generating {
+        format!(" +{body_lines} body lines ")
+    } else {
+        String::new()
+    };
+    let hint_w = hint.chars().count() as u16;
     let label_area = Rect {
         x: area.x,
         y: area.y,
         width: prompt_w.min(area.width),
         height: 1,
     };
+    let body_w = area
+        .width
+        .saturating_sub(prompt_w)
+        .saturating_sub(hint_w);
     let body_area = Rect {
         x: area.x + prompt_w.min(area.width),
         y: area.y,
-        width: area.width.saturating_sub(prompt_w),
+        width: body_w,
         height: 1,
     };
     frame.render_widget(Paragraph::new(Span::raw(prompt)).style(label_style), label_area);
@@ -134,4 +166,22 @@ pub fn render(state: &InputState, area: Rect, frame: &mut Frame, theme: &Theme) 
         Paragraph::new(Span::raw(body_with_caret)).style(body_style),
         body_area,
     );
+    if hint_w > 0 {
+        let hint_area = Rect {
+            x: area.x + prompt_w + body_w,
+            y: area.y,
+            width: hint_w,
+            height: 1,
+        };
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                hint,
+                Style::default()
+                    .bg(theme.selection_bg(false))
+                    .fg(theme.fg_dim)
+                    .add_modifier(Modifier::ITALIC),
+            )),
+            hint_area,
+        );
+    }
 }

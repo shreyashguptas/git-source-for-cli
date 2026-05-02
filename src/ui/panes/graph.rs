@@ -101,7 +101,9 @@ pub fn render(app: &mut App, area: Rect, frame: &mut Frame, theme: &Theme) {
                 crate::git::RefName::HeadAt(_) | crate::git::RefName::Head
             )
         });
-        let mut spans = graph::row_spans(row, commit, theme, is_head, max_lanes, body_width);
+        let is_ahead = ahead.contains(&commit.hash);
+        let mut spans =
+            graph::row_spans(row, commit, theme, is_head, is_ahead, max_lanes, body_width);
         if let Some(m) = divergence_marker_static(&commit.hash, ahead, behind, theme) {
             spans.insert(0, m);
         }

@@ -25,7 +25,7 @@ fn render_to_text(commits: &[Commit]) -> String {
     let mut out = String::new();
     for row in &rows {
         let commit = &commits[row.commit_idx];
-        let spans = row_spans(row, commit, &theme, false, 0, usize::MAX);
+        let spans = row_spans(row, commit, &theme, false, false, 0, usize::MAX);
         for s in spans {
             out.push_str(&s.content);
         }

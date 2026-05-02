@@ -96,6 +96,59 @@ pub async fn force_delete_branch(repo_root: &Path, branch: &str) -> Result<Strin
 }
 
 /// Discard unstaged changes to a file (and remove if untracked).
+/// Move HEAD back one commit, keeping the change staged in the working
+/// tree (`git reset --soft HEAD^`). The undone changes reappear in the
+/// Changes pane as staged, so nothing is lost — the operation is reversible
+/// via the reflog. Caller is responsible for checking that HEAD is on a
+/// branch, has a parent, and isn't already pushed.
+pub async fn uncommit_soft(repo_root: &Path) -> Result<String> {
+    exec::run(repo_root, ["reset", "--soft", "HEAD^"]).await?;
+    Ok("uncommitted — changes are back in the staging area".to_string())
+}
+
+/// Summary of the current HEAD commit. Returns `None` when the repo has no
+/// commits yet (unborn HEAD). `has_parent` is false on the root commit, so
+/// callers can refuse to uncommit it.
+pub struct HeadSummary {
+    pub short: String,
+    pub subject: String,
+    pub has_parent: bool,
+}
+
+pub async fn head_summary(repo_root: &Path) -> Result<Option<HeadSummary>> {
+    // %h short hash, %s subject. NUL-separated so subject lines with `:` etc.
+    // don't confuse parsing.
+    let out = match exec::run_optional(
+        repo_root,
+        ["log", "-1", "--pretty=format:%h%x00%s", "HEAD"],
+    )
+    .await?
+    {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+    let line = out.lines().next().unwrap_or("");
+    let mut parts = line.splitn(2, '\x00');
+    let short = parts.next().unwrap_or("").to_string();
+    let subject = parts.next().unwrap_or("").to_string();
+    if short.is_empty() {
+        return Ok(None);
+    }
+    // Parent check is independent — a successful HEAD log doesn't tell us
+    // whether HEAD has a parent. `rev-parse --verify HEAD^` exits non-zero
+    // on the root commit.
+    let has_parent = exec::run_optional(repo_root, ["rev-parse", "--verify", "HEAD^"])
+        .await
+        .ok()
+        .flatten()
+        .is_some();
+    Ok(Some(HeadSummary {
+        short,
+        subject,
+        has_parent,
+    }))
+}
+
 pub async fn discard_file(repo_root: &Path, path: &str) -> Result<String> {
     // restore tracked changes; if untracked, remove the file from disk.
     if exec::run(repo_root, ["restore", "--", path]).await.is_err() {

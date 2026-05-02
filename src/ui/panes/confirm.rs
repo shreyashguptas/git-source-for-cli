@@ -20,9 +20,17 @@ pub struct ConfirmDialog {
 
 #[derive(Debug, Clone)]
 pub enum ConfirmAction {
-    DeleteBranch { name: String, force: bool },
+    DeleteBranch {
+        name: String,
+        force: bool,
+        /// When set, the branch is checked out at this worktree path. The
+        /// confirmed action will `git worktree remove` it (force-fallback
+        /// if dirty) before deleting the branch.
+        worktree: Option<std::path::PathBuf>,
+    },
     DiscardFile { path: String },
     MergeBranch { name: String },
+    Uncommit,
 }
 
 pub fn render(dialog: &ConfirmDialog, area: Rect, frame: &mut Frame, theme: &Theme) {

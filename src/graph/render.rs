@@ -64,6 +64,7 @@ pub fn row_spans<'a>(
     commit: &'a Commit,
     theme: &Theme,
     is_head: bool,
+    is_ahead: bool,
     max_lanes: usize,
     body_width: usize,
 ) -> Vec<Span<'a>> {
@@ -72,16 +73,29 @@ pub fn row_spans<'a>(
     let lane_slots = max_lanes.max(cells.len());
     let mut spans: Vec<Span<'a>> = Vec::with_capacity(lane_slots + 8);
 
-    // 1. Graph cells, padded to `lane_slots`.
+    // 1. Graph cells, padded to `lane_slots`. The commit-lane `●` adopts the
+    //    same green as the `↑` marker when this commit is ahead of the
+    //    upstream — visual reinforcement that this commit is local-only and
+    //    needs to be pushed. Arms and pass-throughs stay lane-coloured so the
+    //    branch ribbon is still readable.
     for i in 0..lane_slots {
         if let Some(cell) = cells.get(i) {
             let lane_key = lane_key_for_cell(row, cell.lane);
             let col = color::for_lane(cell.lane, lane_key);
-            let glyph_style = Style::default().fg(col);
+            let is_commit_cell = i == row.lane && cell.glyph == '●';
+            let fg = if is_commit_cell && is_ahead {
+                theme.added
+            } else {
+                col
+            };
+            let mut style = Style::default().fg(fg);
+            if is_commit_cell && is_ahead {
+                style = style.add_modifier(Modifier::BOLD);
+            }
             let mut s = String::new();
             s.push(cell.glyph);
             s.push(cell.spacer);
-            spans.push(Span::styled(s, glyph_style));
+            spans.push(Span::styled(s, style));
         } else {
             spans.push(Span::raw("  "));
         }

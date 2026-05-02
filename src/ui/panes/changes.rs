@@ -10,7 +10,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::{
     app::{is_fully_staged, App, ChangeAction, InputMode, Pane},
     git::{ChangeKind, FileChange},
-    ui::{theme::Theme, toolbar},
+    ui::{file_icon::file_icon, theme::Theme, toolbar},
 };
 
 /// Toolbar definition. Order is what the user sees left-to-right.
@@ -18,8 +18,10 @@ const BUTTONS: &[(&str, ChangeAction)] = &[
     ("✓ commit", ChangeAction::Commit),
     ("⇡ commit & push", ChangeAction::CommitAndPush),
     ("✨ generate message", ChangeAction::AiMessage),
+    ("≣ view all", ChangeAction::ViewAll),
     ("+ stage all", ChangeAction::StageAll),
     ("− unstage all", ChangeAction::UnstageAll),
+    ("↶ uncommit", ChangeAction::Uncommit),
     ("↻ refresh", ChangeAction::Refresh),
 ];
 
@@ -201,7 +203,9 @@ fn button_style(action: ChangeAction) -> Style {
         ChangeAction::AiMessage => Color::Rgb(0xFF, 0xD8, 0x8E),    // peach (sparkles)
         ChangeAction::StageAll => Color::Rgb(0xA8, 0xE0, 0xB6),     // mint
         ChangeAction::UnstageAll => Color::Rgb(0xE2, 0xA8, 0xA8),   // pale red
+        ChangeAction::Uncommit => Color::Rgb(0xFF, 0xB0, 0xB0),     // soft coral (destructive cue)
         ChangeAction::Refresh => Color::Rgb(0xB6, 0xC2, 0xE6),      // periwinkle
+        ChangeAction::ViewAll => Color::Rgb(0xE5, 0xD0, 0x95),      // soft gold
     };
     Style::default().fg(ink).bg(bg).add_modifier(Modifier::BOLD)
 }
@@ -376,45 +380,6 @@ fn status_badge(kind: ChangeKind, theme: &Theme) -> Badge {
         ChangeKind::Unknown => ("?", Style::default().fg(theme.fg_dim)),
     };
     Badge { text, style }
-}
-
-fn file_icon(path: &str, theme: &Theme) -> (&'static str, Style) {
-    let lower = path.to_ascii_lowercase();
-    let name = lower.rsplit('/').next().unwrap_or(lower.as_str());
-    let ext = name.rsplit_once('.').map(|(_, ext)| ext).unwrap_or("");
-
-    let (icon, color) = match name {
-        "cargo.toml" | "cargo.lock" => ("", Color::Rgb(0xDE, 0xA5, 0x84)),
-        "dockerfile" => ("", Color::Rgb(0x24, 0x96, 0xED)),
-        "makefile" => ("", Color::Rgb(0xB8, 0xB8, 0xB8)),
-        _ => match ext {
-            "rs" => ("", Color::Rgb(0xDE, 0xA5, 0x84)),
-            "ts" => ("", Color::Rgb(0x31, 0x78, 0xC6)),
-            "tsx" => ("", Color::Rgb(0x61, 0xDA, 0xFB)),
-            "js" | "mjs" | "cjs" => ("", Color::Rgb(0xF7, 0xDF, 0x1E)),
-            "jsx" => ("", Color::Rgb(0x61, 0xDA, 0xFB)),
-            "json" => ("", Color::Rgb(0xF7, 0xDF, 0x1E)),
-            "html" | "htm" => ("", Color::Rgb(0xE3, 0x4C, 0x26)),
-            "css" => ("", Color::Rgb(0x56, 0x9C, 0xD6)),
-            "scss" | "sass" => ("", Color::Rgb(0xC6, 0x53, 0x8C)),
-            "md" | "markdown" => ("", Color::Rgb(0x56, 0x9C, 0xD6)),
-            "py" => ("", Color::Rgb(0xFF, 0xD4, 0x3B)),
-            "go" => ("", Color::Rgb(0x00, 0xAD, 0xD8)),
-            "java" => ("", Color::Rgb(0xF8, 0x98, 0x20)),
-            "kt" | "kts" => ("", Color::Rgb(0xB1, 0x25, 0xEA)),
-            "rb" => ("", Color::Rgb(0xCC, 0x34, 0x2D)),
-            "php" => ("", Color::Rgb(0x77, 0x7B, 0xB4)),
-            "sh" | "bash" | "zsh" | "fish" => ("", Color::Rgb(0x89, 0xE0, 0x51)),
-            "yml" | "yaml" | "toml" | "ini" => ("", theme.fg_dim),
-            "c" | "h" => ("", Color::Rgb(0x59, 0x9E, 0xD8)),
-            "cc" | "cpp" | "cxx" | "hpp" | "hh" => ("", Color::Rgb(0x00, 0x59, 0x9C)),
-            "cs" => ("󰌛", Color::Rgb(0x68, 0x2A, 0xD7)),
-            "swift" => ("", Color::Rgb(0xF0, 0x51, 0x38)),
-            _ => ("", theme.fg_dim),
-        },
-    };
-
-    (icon, Style::default().fg(color))
 }
 
 fn truncate_end(value: &str, max_width: usize) -> String {

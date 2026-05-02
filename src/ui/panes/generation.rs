@@ -314,11 +314,15 @@ fn suggest_fix(err: &str) -> String {
     if lower.contains("connection refused") || lower.contains("timed out connecting") {
         "Hint: the local Ollama daemon doesn't seem to be running. Start it with `ollama serve` in another terminal.".to_string()
     } else if lower.contains("model") && (lower.contains("not found") || lower.contains("missing")) {
-        "Hint: the selected model isn't installed. Pull it with `ollama pull <model>` or pick another via M / settings.".to_string()
+        "Hint: the selected model isn't installed locally. Pull it with `ollama pull <model>` in another terminal.".to_string()
     } else if lower.contains("no models") {
         "Hint: Ollama has no models installed yet. Try `ollama pull qwen2.5-coder` to get started.".to_string()
     } else if lower.contains("nothing staged") {
         "Hint: stage at least one file (Space, or the + chip on a row) before generating a commit message.".to_string()
+    } else if lower.contains("returned no text") {
+        "Hint: chat models like qwen2.5-coder:3b or llama3.2:3b can generate commit messages. Switch via the bottom chip whenever you want.".to_string()
+    } else if lower.contains("only reasoning") || lower.contains("non-text content") {
+        "Hint: this model thinks but never answers — switch to a non-reasoning chat model via the bottom chip when you want.".to_string()
     } else {
         "Press r to retry, or Esc to dismiss. Check `ollama serve` is running and the selected model is available.".to_string()
     }

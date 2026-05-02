@@ -312,7 +312,7 @@ fn pane_hints(app: &App) -> &'static str {
     }
     match app.active_pane {
         Pane::Branches => "↑↓ graph preview · Enter checkout · n new · p push · P pull · m merge · d del",
-        Pane::Changes => "Space stage · a all · c commit · ^G generate message · M model · , settings · x discard",
+        Pane::Changes => "Space stage · a all · c commit · ^G generate message · U uncommit · x discard",
         Pane::Graph => "↑↓ live preview · Enter full · o github",
     }
 }

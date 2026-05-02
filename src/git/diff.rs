@@ -37,6 +37,35 @@ pub async fn cached(repo_root: &Path) -> Result<String> {
         .context("git diff --cached failed")
 }
 
+/// Aggregate diff covering every change in the working tree: combined
+/// staged+unstaged for tracked files (`git diff HEAD`) followed by an
+/// untracked-file diff for each path in `untracked_paths`. Falls back to
+/// `git diff --cached` when HEAD doesn't exist (unborn branch).
+pub async fn all_changes(repo_root: &Path, untracked_paths: &[String]) -> Result<String> {
+    // `git diff HEAD` collapses staged + unstaged for the same file into one
+    // section — which is what the user wants when scanning "everything
+    // uncommitted." On an unborn branch HEAD doesn't exist; fall back to the
+    // index-only diff so we still render whatever is staged.
+    let mut out = match exec::run_optional(repo_root, ["diff", "HEAD", "--no-color"]).await? {
+        Some(s) => s,
+        None => exec::run_optional(repo_root, ["diff", "--cached", "--no-color"])
+            .await?
+            .unwrap_or_default(),
+    };
+
+    for path in untracked_paths {
+        let body = self::untracked(repo_root, path).await.unwrap_or_default();
+        if body.is_empty() {
+            continue;
+        }
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&body);
+    }
+    Ok(out)
+}
+
 /// Show a commit: full message + diff vs first parent (or empty parent for root).
 pub async fn show(repo_root: &Path, sha: &str) -> Result<String> {
     exec::run(
