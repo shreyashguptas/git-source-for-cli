@@ -68,10 +68,39 @@ pub enum InputMode {
 /// to hit-test clicks. Updated by the view code on every render.
 #[derive(Debug, Clone, Default)]
 pub struct PaneRects {
+    /// The full main-content area used by the panes (excludes status bar /
+    /// commit input / toast). Useful for mouse-drag clamping.
+    pub main_area: Rect,
     pub branches: Rect,
     pub changes: Rect,
     pub graph: Rect,
     pub preview: Option<Rect>,
+}
+
+/// User-driven width/height overrides for the layout. Stored in absolute
+/// columns/rows; clamped to sane mins on each render. `None` means "use the
+/// default proportion".
+#[derive(Debug, Clone, Default)]
+pub struct LayoutOverrides {
+    /// Width of the left column (Branches + Changes).
+    pub left_width: Option<u16>,
+    /// Width of the Graph column (only meaningful when preview is shown).
+    pub graph_width: Option<u16>,
+    /// Height of the Branches pane within the left column.
+    pub branches_height: Option<u16>,
+}
+
+/// Which splitter the user is currently dragging, if any.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ResizeDrag {
+    #[default]
+    None,
+    /// Vertical splitter between the left column and the Graph column.
+    LeftGraph,
+    /// Vertical splitter between the Graph and Preview columns.
+    GraphPreview,
+    /// Horizontal splitter between Branches and Changes inside the left column.
+    BranchesChanges,
 }
 
 /// Top-level application state.
@@ -131,6 +160,11 @@ pub struct App {
     pub model_picker: Option<ModelPickerState>,
     /// Handle to the in-flight generation task — kept so Esc can abort it.
     pub gen_task: Option<tokio::task::JoinHandle<()>>,
+
+    /// User-driven sizing overrides — set by drag, read by the view.
+    pub layout_overrides: LayoutOverrides,
+    /// Active drag, if any. Set on left-button down over a splitter, cleared on up.
+    pub active_drag: ResizeDrag,
 }
 
 impl App {
@@ -171,6 +205,8 @@ impl App {
             ollama: OllamaAvailability::Unknown,
             model_picker: None,
             gen_task: None,
+            layout_overrides: LayoutOverrides::default(),
+            active_drag: ResizeDrag::None,
         };
         s.branches_state.select(Some(0));
         s.changes_state.select(Some(0));
@@ -396,6 +432,11 @@ impl App {
                 self.update_preview();
             }
             KeyCode::Char('r') => self.spawn_refresh(),
+            // `=` resets any drag-resized panes back to default proportions.
+            KeyCode::Char('=') => {
+                self.layout_overrides = crate::app::LayoutOverrides::default();
+                self.toast = Some("layout reset".to_string());
+            }
             KeyCode::Char('1') => {
                 self.active_pane = Pane::Branches;
                 self.update_preview();
@@ -546,8 +587,8 @@ impl App {
         Some(format!("{web}/commit/{sha}"))
     }
 
-    /// Mouse handling: left-click focuses + selects, scroll wheel scrolls.
-    /// Modal overlays consume scroll only; clicks on them do nothing (use Esc).
+    /// Mouse handling: left-click focuses + selects, scroll wheel scrolls,
+    /// drag on a pane border resizes the layout.
     fn handle_mouse(&mut self, ev: MouseEvent) {
         let pos = (ev.column, ev.row);
 
@@ -562,18 +603,20 @@ impl App {
             return;
         }
         if overlay_active {
-            // Help/confirm don't scroll; ignore mouse entirely.
             return;
         }
 
-        // Don't redirect mouse while typing a commit message — it shouldn't
-        // accidentally move selection mid-type.
+        // Don't redirect mouse while typing a commit message.
         if self.input_mode == InputMode::Commit {
             return;
         }
 
         match ev.kind {
             MouseEventKind::Down(MouseButton::Left) => self.handle_mouse_click(pos),
+            MouseEventKind::Drag(MouseButton::Left) => self.handle_mouse_drag(pos),
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.active_drag = ResizeDrag::None;
+            }
             MouseEventKind::ScrollUp => self.handle_mouse_scroll(pos, -3),
             MouseEventKind::ScrollDown => self.handle_mouse_scroll(pos, 3),
             _ => {}
@@ -581,7 +624,13 @@ impl App {
     }
 
     fn handle_mouse_click(&mut self, (x, y): (u16, u16)) {
-        // Clone rect copies because borrows below would clash with self.update_preview()
+        // First: did they grab a splitter? If so, start a drag and don't also
+        // select an item.
+        if let Some(drag) = self.detect_splitter(x, y) {
+            self.active_drag = drag;
+            return;
+        }
+
         let rects = self.last_rects.clone();
         if hit(rects.branches, x, y) {
             self.active_pane = Pane::Branches;
@@ -597,10 +646,79 @@ impl App {
             self.update_preview();
         } else if let Some(p) = rects.preview {
             if hit(p, x, y) {
-                // Clicking the preview pane just gives it scroll focus; we don't
-                // change the selected pane (the preview mirrors Graph/Changes).
-                // No-op for now.
+                // Preview clicks: no-op (it mirrors Graph/Changes selection).
             }
+        }
+    }
+
+    /// Was the click within ±1 col/row of one of the pane splitters?
+    fn detect_splitter(&self, x: u16, y: u16) -> Option<ResizeDrag> {
+        let r = &self.last_rects;
+        if r.branches.width == 0 {
+            return None;
+        }
+        let tol = 1u16;
+
+        // Horizontal splitter inside the left column (Branches above Changes)
+        if x >= r.branches.x && x < r.branches.x + r.branches.width {
+            let h_split = r.branches.y + r.branches.height;
+            if y.abs_diff(h_split) <= tol {
+                return Some(ResizeDrag::BranchesChanges);
+            }
+        }
+
+        // Need the click to be within the panes' vertical extent for vertical splitters.
+        let v_top = r.branches.y;
+        let v_bot = r.graph.y + r.graph.height;
+        if y < v_top || y >= v_bot {
+            return None;
+        }
+
+        // Vertical splitter between Left column and Graph
+        let left_split = r.branches.x + r.branches.width;
+        if x.abs_diff(left_split) <= tol {
+            return Some(ResizeDrag::LeftGraph);
+        }
+
+        // Vertical splitter between Graph and Preview (only when preview is shown)
+        if let Some(p) = r.preview {
+            let right_split = p.x;
+            if x.abs_diff(right_split) <= tol {
+                return Some(ResizeDrag::GraphPreview);
+            }
+        }
+        None
+    }
+
+    fn handle_mouse_drag(&mut self, (x, y): (u16, u16)) {
+        let area = self.last_rects.main_area;
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+
+        match self.active_drag {
+            ResizeDrag::LeftGraph => {
+                // Width of the left column = mouse x relative to its left edge.
+                let new_w = x.saturating_sub(area.x);
+                // Reserve at least 40 cols for graph (+ preview if present).
+                let max = area.width.saturating_sub(40);
+                self.layout_overrides.left_width = Some(new_w.clamp(15, max.max(15)));
+            }
+            ResizeDrag::GraphPreview => {
+                // Width of graph = mouse x relative to graph's left edge.
+                let new_w = x.saturating_sub(self.last_rects.graph.x);
+                let left_w = self.last_rects.branches.width;
+                let max = area.width.saturating_sub(left_w + 20);
+                self.layout_overrides.graph_width = Some(new_w.clamp(20, max.max(20)));
+            }
+            ResizeDrag::BranchesChanges => {
+                // Height of branches pane = mouse y relative to its top.
+                let new_h = y.saturating_sub(self.last_rects.branches.y);
+                // Leave at least 4 rows for changes pane below.
+                let max = area.height.saturating_sub(8);
+                self.layout_overrides.branches_height = Some(new_h.clamp(3, max.max(3)));
+            }
+            ResizeDrag::None => {}
         }
     }
 

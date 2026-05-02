@@ -79,7 +79,9 @@ gsc --help
 | Action | Result |
 |---|---|
 | Left-click a pane | focus that pane and select the item under the cursor |
+| Click + drag a pane border | resize the panes (works for both vertical column borders and the branches/changes horizontal split) |
 | Scroll wheel inside a pane | scroll that pane (Preview scrolls its content; Branches/Changes/Graph move the selection) |
+| `=` key | reset all panes to default proportions if you've dragged things into a corner |
 
 **macOS tip**: while mouse capture is on, normal text-selection in the terminal is intercepted. Hold **Option** while dragging to bypass capture and select text natively (works in Terminal, iTerm2, Ghostty, Warp, kitty).
 

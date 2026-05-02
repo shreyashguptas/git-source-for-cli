@@ -69,45 +69,115 @@ pub fn render(app: &mut App, frame: &mut Frame) {
 
 fn render_main(app: &mut App, frame: &mut Frame, area: Rect, theme: &theme::Theme) {
     let show_preview = area.width >= PREVIEW_MIN_WIDTH;
+    let (left_rect, graph_rect, preview_rect) = compute_columns(area, app, show_preview);
+    let (branches_rect, changes_rect) = compute_left_split(left_rect, app);
 
-    let cols = if show_preview {
-        // Three columns: branches+changes (left), graph (middle), preview (right).
-        Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(25),
-                Constraint::Percentage(35),
-                Constraint::Percentage(40),
-            ])
-            .split(area)
-    } else {
-        // Two columns (the original layout).
-        Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
-            .split(area)
-    };
-
-    let left = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-        .split(cols[0]);
-
-    // Capture rects for the mouse handler (clicks need to know what's where).
+    // Capture rects for the mouse handler.
     app.last_rects = PaneRects {
-        branches: left[0],
-        changes: left[1],
-        graph: cols[1],
-        preview: if show_preview { Some(cols[2]) } else { None },
+        main_area: area,
+        branches: branches_rect,
+        changes: changes_rect,
+        graph: graph_rect,
+        preview: preview_rect,
     };
 
-    panes::branches::render(app, left[0], frame, theme);
-    panes::changes::render(app, left[1], frame, theme);
-    panes::graph::render(app, cols[1], frame, theme);
-
-    if show_preview {
-        panes::preview::render(app, cols[2], frame, theme);
+    panes::branches::render(app, branches_rect, frame, theme);
+    panes::changes::render(app, changes_rect, frame, theme);
+    panes::graph::render(app, graph_rect, frame, theme);
+    if let Some(p) = preview_rect {
+        panes::preview::render(app, p, frame, theme);
     }
+}
+
+/// Compute the three (or two) column rects honoring user resize overrides.
+fn compute_columns(area: Rect, app: &App, show_preview: bool) -> (Rect, Rect, Option<Rect>) {
+    if show_preview {
+        // Defaults: 25 / 35 / 40 percent.
+        let default_left = (area.width as u32 * 25 / 100) as u16;
+        let default_graph = (area.width as u32 * 35 / 100) as u16;
+
+        let left_w = app
+            .layout_overrides
+            .left_width
+            .unwrap_or(default_left)
+            .clamp(15, area.width.saturating_sub(40).max(15));
+
+        let remaining = area.width.saturating_sub(left_w);
+        let graph_w = app
+            .layout_overrides
+            .graph_width
+            .unwrap_or(default_graph)
+            .clamp(20, remaining.saturating_sub(20).max(20));
+
+        let preview_w = remaining.saturating_sub(graph_w).max(20);
+
+        let left = Rect {
+            x: area.x,
+            y: area.y,
+            width: left_w,
+            height: area.height,
+        };
+        let graph = Rect {
+            x: area.x + left_w,
+            y: area.y,
+            width: graph_w,
+            height: area.height,
+        };
+        let preview = Rect {
+            x: area.x + left_w + graph_w,
+            y: area.y,
+            width: preview_w,
+            height: area.height,
+        };
+        (left, graph, Some(preview))
+    } else {
+        // Two-column fallback for narrow terminals.
+        let default_left = (area.width as u32 * 35 / 100) as u16;
+        let left_w = app
+            .layout_overrides
+            .left_width
+            .unwrap_or(default_left)
+            .clamp(15, area.width.saturating_sub(20).max(15));
+        let graph_w = area.width.saturating_sub(left_w);
+
+        let left = Rect {
+            x: area.x,
+            y: area.y,
+            width: left_w,
+            height: area.height,
+        };
+        let graph = Rect {
+            x: area.x + left_w,
+            y: area.y,
+            width: graph_w,
+            height: area.height,
+        };
+        (left, graph, None)
+    }
+}
+
+/// Compute Branches (top) + Changes (bottom) inside the left column.
+fn compute_left_split(left: Rect, app: &App) -> (Rect, Rect) {
+    let default_branches = (left.height as u32 * 60 / 100) as u16;
+    let branches_h = app
+        .layout_overrides
+        .branches_height
+        .unwrap_or(default_branches)
+        .clamp(3, left.height.saturating_sub(4).max(3));
+
+    let branches = Rect {
+        x: left.x,
+        y: left.y,
+        width: left.width,
+        height: branches_h,
+    };
+    let changes = Rect {
+        x: left.x,
+        y: left.y + branches_h,
+        width: left.width,
+        height: left.height.saturating_sub(branches_h),
+    };
+    (branches, changes)
 }
 
 fn render_status_bar(app: &App, frame: &mut Frame, area: Rect, theme: &theme::Theme) {
