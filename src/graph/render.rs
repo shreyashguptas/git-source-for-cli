@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use ratatui::{
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::Span,
 };
 
@@ -89,13 +89,15 @@ pub fn row_spans<'a>(
 }
 
 fn lane_key_for_cell(row: &Row, lane: usize) -> Option<&str> {
-    if lane == row.lane {
-        return Some(row.lane_key.as_str());
+    // Use the per-lane seed snapshot so a lane keeps the same colour across
+    // every row it's active for. Falls back to the lane's expected SHA only
+    // when we never seeded the lane (rare edge case).
+    if let Some(k) = row.lane_keys.get(lane) {
+        if !k.is_empty() {
+            return Some(k.as_str());
+        }
     }
-    // For non-commit lanes, derive a key from the lane state hash if any.
-    row.lanes
-        .get(lane)
-        .and_then(|opt| opt.as_deref())
+    row.lanes.get(lane).and_then(|opt| opt.as_deref())
 }
 
 /// One logical branch's presence at a commit — consolidates HEAD/local/remote
@@ -162,74 +164,65 @@ fn group_refs(refs: &[RefName]) -> (Vec<RefGroup>, Vec<String>, bool) {
     (groups, tags, bare_head)
 }
 
-/// Build VS Code-style pills:
-/// - local branch  → coloured pill with `◉` (HEAD) or `⎇` (other local) + name
-/// - remote also   → adjacent dim pill with `☁`
-/// - remote-only   → single dim pill with `☁ origin/<name>`
-/// - tags          → italic pill with `▸ name`
-/// - detached HEAD → green pill `◉ HEAD`
-fn render_ref_pills(refs: &[RefName], theme: &Theme) -> Vec<Span<'static>> {
+/// Build VS Code-style pills with colour-coded backgrounds. Every pill uses
+/// dark text on a bright background so contrast is consistently high.
+///
+/// - HEAD          → bright green pill `◉ <branch>`
+/// - local branch  → light per-branch coloured pill `⎇ <name>`
+/// - synced (☁)    → adjacent sky-blue chip with the cloud icon
+/// - remote-only   → muted slate pill `☁ origin/<name>`
+/// - tags          → gold pill `▸ <name>`
+/// - detached HEAD → standalone bright green pill `◉ HEAD`
+fn render_ref_pills(refs: &[RefName], _theme: &Theme) -> Vec<Span<'static>> {
     let (groups, tags, bare_head) = group_refs(refs);
     let mut spans = Vec::new();
-
-    // True ink color used inside coloured pills so the text reads well on
-    // bright backgrounds. Slightly off-black so cursors / selection still pop.
-    let ink = Color::Rgb(0x10, 0x14, 0x18);
 
     // Detached HEAD that isn't co-located with any branch label → standalone pill.
     if bare_head && !groups.iter().any(|g| g.is_head) {
         spans.push(Span::styled(
             " ◉ HEAD ".to_string(),
             Style::default()
-                .bg(theme.branch_current)
-                .fg(ink)
+                .bg(color::HEAD_PILL_BG)
+                .fg(color::HEAD_PILL_FG)
                 .add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::raw(" "));
     }
 
     for g in groups {
-        // Pick a stable per-branch lane color for the local pill so different
-        // branches show up in different colours (matches the lane coloring).
-        let pill_bg = if g.is_head {
-            theme.branch_current
-        } else {
-            color::for_key(&g.name)
-        };
-
         if g.has_local {
             let icon = if g.is_head { "◉" } else { "⎇" };
+            let (bg, fg) = if g.is_head {
+                (color::HEAD_PILL_BG, color::HEAD_PILL_FG)
+            } else {
+                (color::pill_bg_for_branch(&g.name), color::PILL_FG)
+            };
             spans.push(Span::styled(
                 format!(" {icon} {} ", g.name),
-                Style::default()
-                    .bg(pill_bg)
-                    .fg(ink)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().bg(bg).fg(fg).add_modifier(Modifier::BOLD),
             ));
         } else if g.has_remote {
-            // Remote-only — show with the cloud icon and the full origin path.
             spans.push(Span::styled(
                 format!(" ☁ origin/{} ", g.name),
                 Style::default()
-                    .bg(theme.fg_dim)
-                    .fg(ink)
+                    .bg(color::REMOTE_ONLY_BG)
+                    .fg(color::REMOTE_ONLY_FG)
                     .add_modifier(Modifier::BOLD),
             ));
         }
 
-        // If both local AND remote, append a tight cloud chip right next to
-        // the local pill (no gap) — this is the "synced to GitHub" indicator.
+        // If both local AND remote, append a tight cloud chip immediately
+        // after the local pill (no gap) — this is the "synced to GitHub" cue.
         if g.has_local && g.has_remote {
             spans.push(Span::styled(
                 " ☁ ".to_string(),
                 Style::default()
-                    .bg(theme.fg_dim)
-                    .fg(ink)
+                    .bg(color::CLOUD_CHIP_BG)
+                    .fg(color::CLOUD_CHIP_FG)
                     .add_modifier(Modifier::BOLD),
             ));
         }
 
-        // Separator between distinct branch groups.
         spans.push(Span::raw(" "));
     }
 
@@ -237,9 +230,9 @@ fn render_ref_pills(refs: &[RefName], theme: &Theme) -> Vec<Span<'static>> {
         spans.push(Span::styled(
             format!(" ▸ {t} "),
             Style::default()
-                .bg(theme.modified)
-                .fg(ink)
-                .add_modifier(Modifier::ITALIC),
+                .bg(color::TAG_PILL_BG)
+                .fg(color::TAG_PILL_FG)
+                .add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::raw(" "));
     }

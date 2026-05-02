@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 
-use crate::git::Commit;
+use crate::git::{Commit, RefName};
 
 /// One rendered row in the graph (1:1 with a commit).
 #[derive(Debug, Clone)]
@@ -30,8 +30,12 @@ pub struct Row {
     /// the next commit). Slots that are `Some` will draw `│` if they're not
     /// the commit/absorbed/spawned lane themselves.
     pub lanes: Vec<Option<String>>,
-    /// Stable color key for `lane` (first commit hash that ever landed there).
+    /// Stable color key for `lane` (branch name when known, else first SHA).
     pub lane_key: String,
+    /// Color key for EVERY lane at this row (parallel to `lanes`). Lets the
+    /// renderer color pass-through `│` lines consistently across rows so the
+    /// graph reads as continuous coloured ribbons rather than a SHA mosaic.
+    pub lane_keys: Vec<String>,
 }
 
 /// Compute the per-row layout for a slice of commits in date order (newest first).
@@ -67,8 +71,19 @@ pub fn layout(commits: &[Commit]) -> Vec<Row> {
             }
         };
 
-        // Color key: first SHA that landed in this lane keeps it.
-        if lane_keys.get(commit_lane).map(String::is_empty).unwrap_or(true) {
+        // Color key: prefer a branch name (HeadAt > LocalBranch > stripped
+        // RemoteBranch), so lanes that own a branch always get the same colour
+        // across runs. Fall back to SHA when no branch ref is known yet.
+        let preferred = preferred_seed(&c.refs);
+        let needs_seed = lane_keys
+            .get(commit_lane)
+            .map(String::is_empty)
+            .unwrap_or(true);
+        if let Some(seed) = preferred {
+            // Branch refs always upgrade — a HEAD/branch is more informative
+            // than the SHA we may have set on a previous visit.
+            ensure_lane_key_force(&mut lane_keys, commit_lane, &seed);
+        } else if needs_seed {
             ensure_lane_key(&mut lane_keys, commit_lane, &c.hash);
         }
         let lane_key = lane_keys[commit_lane].clone();
@@ -127,6 +142,7 @@ pub fn layout(commits: &[Commit]) -> Vec<Row> {
 
         // Step 7: snapshot lane state for this row.
         let lane_snapshot = lanes.clone();
+        let lane_keys_snapshot = lane_keys.clone();
 
         // Step 8: trim trailing free lanes so the visualization isn't padded
         // with empty space.
@@ -142,9 +158,43 @@ pub fn layout(commits: &[Commit]) -> Vec<Row> {
             spawned,
             lanes: lane_snapshot,
             lane_key,
+            lane_keys: lane_keys_snapshot,
         });
     }
     rows
+}
+
+/// Pick a branch-name seed from a commit's refs, in priority order:
+/// HeadAt > LocalBranch > RemoteBranch (with the remote prefix stripped).
+fn preferred_seed(refs: &[RefName]) -> Option<String> {
+    for r in refs {
+        if let RefName::HeadAt(name) = r {
+            return Some(name.clone());
+        }
+    }
+    for r in refs {
+        if let RefName::LocalBranch(name) = r {
+            return Some(name.clone());
+        }
+    }
+    for r in refs {
+        if let RefName::RemoteBranch(full) = r {
+            // "origin/main" → "main"
+            return Some(
+                full.split_once('/')
+                    .map(|(_remote, rest)| rest.to_string())
+                    .unwrap_or_else(|| full.clone()),
+            );
+        }
+    }
+    None
+}
+
+fn ensure_lane_key_force(lane_keys: &mut Vec<String>, idx: usize, seed: &str) {
+    while lane_keys.len() <= idx {
+        lane_keys.push(String::new());
+    }
+    lane_keys[idx] = seed.to_string();
 }
 
 fn first_free_lane(lanes: &[Option<String>]) -> usize {
