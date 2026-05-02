@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     future::Future,
     io,
+    path::PathBuf,
     pin::Pin,
     time::Duration,
 };
@@ -148,6 +149,10 @@ pub struct App {
     /// Commits origin has but the local HEAD doesn't (i.e. unpulled).
     pub behind_shas: HashSet<String>,
 
+    /// Map of branch name → worktree path. Lets us flag branches that are
+    /// checked out in another worktree (which `git checkout` here would refuse).
+    pub worktrees: HashMap<String, PathBuf>,
+
     /// Most recent on-screen pane rectangles, written by `ui::view::render`.
     pub last_rects: PaneRects,
 
@@ -200,6 +205,7 @@ impl App {
             prs_last_refresh: std::time::Instant::now() - Duration::from_secs(3600),
             ahead_shas: HashSet::new(),
             behind_shas: HashSet::new(),
+            worktrees: HashMap::new(),
             last_rects: PaneRects::default(),
             config,
             ollama: OllamaAvailability::Unknown,
@@ -259,6 +265,9 @@ impl App {
             AppEvent::DivergenceLoaded { ahead, behind } => {
                 self.ahead_shas = ahead;
                 self.behind_shas = behind;
+            }
+            AppEvent::WorktreesLoaded(map) => {
+                self.worktrees = map;
             }
             AppEvent::OverlayLoaded(c) => {
                 if self.overlay.is_some() {
@@ -651,39 +660,50 @@ impl App {
         }
     }
 
-    /// Was the click within ±1 col/row of one of the pane splitters?
+    /// Did the click land exactly on a splitter (the actual border line)?
+    /// We hit-test on the two adjacent border columns/rows that visually form
+    /// the splitter — anything one cell INTO a pane is content, not splitter.
+    /// This avoids the bug where clicking the first row of Changes (or the
+    /// leftmost col of Graph) was eaten by drag-detection.
     fn detect_splitter(&self, x: u16, y: u16) -> Option<ResizeDrag> {
         let r = &self.last_rects;
         if r.branches.width == 0 {
             return None;
         }
-        let tol = 1u16;
 
-        // Horizontal splitter inside the left column (Branches above Changes)
+        // Horizontal splitter inside the left column (Branches above Changes).
+        // The splitter visually sits on the two adjacent border rows:
+        //   - bottom border of Branches (last row of Branches rect)
+        //   - top border of Changes (first row of Changes rect)
         if x >= r.branches.x && x < r.branches.x + r.branches.width {
-            let h_split = r.branches.y + r.branches.height;
-            if y.abs_diff(h_split) <= tol {
+            let branches_bottom_border = r.branches.y + r.branches.height.saturating_sub(1);
+            let changes_top_border = r.changes.y;
+            if y == branches_bottom_border || y == changes_top_border {
                 return Some(ResizeDrag::BranchesChanges);
             }
         }
 
-        // Need the click to be within the panes' vertical extent for vertical splitters.
+        // Vertical splitters require y inside the panes' vertical span.
         let v_top = r.branches.y;
         let v_bot = r.graph.y + r.graph.height;
         if y < v_top || y >= v_bot {
             return None;
         }
 
-        // Vertical splitter between Left column and Graph
-        let left_split = r.branches.x + r.branches.width;
-        if x.abs_diff(left_split) <= tol {
+        // Vertical splitter between Left column and Graph: the rightmost col
+        // of Branches/Changes (their right border) and the leftmost col of
+        // Graph (its left border) — both render as `│` and are valid hit cols.
+        let left_pane_right_border = r.branches.x + r.branches.width.saturating_sub(1);
+        let graph_left_border = r.graph.x;
+        if x == left_pane_right_border || x == graph_left_border {
             return Some(ResizeDrag::LeftGraph);
         }
 
-        // Vertical splitter between Graph and Preview (only when preview is shown)
+        // Vertical splitter between Graph and Preview.
         if let Some(p) = r.preview {
-            let right_split = p.x;
-            if x.abs_diff(right_split) <= tol {
+            let graph_right_border = r.graph.x + r.graph.width.saturating_sub(1);
+            let preview_left_border = p.x;
+            if x == graph_right_border || x == preview_left_border {
                 return Some(ResizeDrag::GraphPreview);
             }
         }
@@ -1215,26 +1235,41 @@ impl App {
     async fn handle_enter(&mut self) {
         match self.active_pane {
             Pane::Branches => {
-                if let Some(idx) = self.branches_state.selected() {
-                    if let Some(b) = self.branches.get(idx) {
-                        if b.is_current {
-                            return;
-                        }
-                        if !self.status.files.is_empty() {
-                            self.toast = Some(
-                                "checkout blocked: working tree has changes (commit/stash first)"
-                                    .to_string(),
-                            );
-                            return;
-                        }
-                        let name = b.name.clone();
-                        let root = self.repo.root.clone();
-                        self.run_op_async(
-                            &format!("checkout {name}"),
-                            Box::pin(async move { git::ops::checkout(&root, &name).await }),
-                        );
+                let Some(idx) = self.branches_state.selected() else {
+                    return;
+                };
+                let Some(b) = self.branches.get(idx) else {
+                    return;
+                };
+                if b.is_current {
+                    self.toast = Some(format!("already on '{}'", b.name));
+                    return;
+                }
+                // Branches checked out in another worktree can't be checked out
+                // here — git would error and the user wouldn't know why.
+                if let Some(wt) = self.worktrees.get(&b.name) {
+                    if wt != &self.repo.root {
+                        self.toast = Some(format!(
+                            "'{}' is checked out in another worktree at {} — checkout blocked",
+                            b.name,
+                            wt.display()
+                        ));
+                        return;
                     }
                 }
+                if !self.status.files.is_empty() {
+                    self.toast = Some(format!(
+                        "checkout '{}' blocked: working tree has changes (commit / stash / discard first)",
+                        b.name
+                    ));
+                    return;
+                }
+                let name = b.name.clone();
+                let root = self.repo.root.clone();
+                self.run_op_async(
+                    &format!("checkout {name}"),
+                    Box::pin(async move { git::ops::checkout(&root, &name).await }),
+                );
             }
             Pane::Changes | Pane::Graph => self.open_details().await,
         }
@@ -1498,6 +1533,15 @@ impl App {
             let ahead = git::log::ahead_of_upstream(&root).await;
             let behind = git::log::behind_upstream(&root).await;
             let _ = tx.send(AppEvent::DivergenceLoaded { ahead, behind }).await;
+        });
+
+        // Worktree map — for the "checked out elsewhere" indicator.
+        let tx = self.events_tx.clone();
+        let root = self.repo.root.clone();
+        tokio::spawn(async move {
+            if let Ok(map) = git::worktree::list(&root).await {
+                let _ = tx.send(AppEvent::WorktreesLoaded(map)).await;
+            }
         });
 
         // PR refresh: throttled to once per 60s.

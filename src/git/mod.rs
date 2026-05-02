@@ -5,6 +5,7 @@ pub mod log;
 pub mod ops;
 pub mod repo;
 pub mod status;
+pub mod worktree;
 
 pub use branches::Branch;
 pub use log::{Commit, RefName};

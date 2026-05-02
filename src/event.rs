@@ -4,7 +4,10 @@ use crossterm::event::{Event as CtEvent, EventStream, KeyEvent, MouseEvent};
 use futures_util::{FutureExt, StreamExt};
 use tokio::{sync::mpsc, time::interval};
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+};
 
 use crate::{
     gh::{Availability, Pr},
@@ -29,6 +32,8 @@ pub enum AppEvent {
     /// SHAs of commits that are local-only vs HEAD's upstream (`@{upstream}..HEAD`)
     /// and the inverse (`HEAD..@{upstream}`). Empty when there's no upstream.
     DivergenceLoaded { ahead: HashSet<String>, behind: HashSet<String> },
+    /// Map of branch name → worktree path (for branches checked out elsewhere).
+    WorktreesLoaded(HashMap<String, PathBuf>),
     GhAvailability(Availability),
     PrsLoaded(HashMap<String, Pr>),
     /// Async-loaded body for the details overlay.

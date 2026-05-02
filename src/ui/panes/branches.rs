@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
@@ -26,7 +28,13 @@ pub fn render(app: &mut App, area: Rect, frame: &mut Frame, theme: &Theme) {
             .iter()
             .map(|b| {
                 let pr = app.prs.get(&b.name);
-                ListItem::new(branch_line(b, pr, area.width, theme))
+                // Worktree info: which worktree owns this branch (if any).
+                // Skip the current repo root because that's just `is_current`.
+                let wt = app
+                    .worktrees
+                    .get(&b.name)
+                    .filter(|p| !b.is_current && **p != app.repo.root);
+                ListItem::new(branch_line(b, pr, wt, area.width, theme))
             })
             .collect()
     };
@@ -49,19 +57,42 @@ pub fn render(app: &mut App, area: Rect, frame: &mut Frame, theme: &Theme) {
     frame.render_stateful_widget(list, area, &mut app.branches_state);
 }
 
-fn branch_line<'a>(b: &'a Branch, pr: Option<&'a Pr>, width: u16, theme: &Theme) -> Line<'a> {
-    let marker = if b.is_current { "* " } else { "  " };
-    let marker_style = if b.is_current {
-        Style::default()
-            .fg(theme.branch_current)
-            .add_modifier(Modifier::BOLD)
+fn branch_line<'a>(
+    b: &'a Branch,
+    pr: Option<&'a Pr>,
+    worktree: Option<&'a PathBuf>,
+    width: u16,
+    theme: &Theme,
+) -> Line<'a> {
+    // Prefix glyph: `*` current, `⎘` checked out in another worktree, ` ` else.
+    let (marker, marker_style) = if b.is_current {
+        (
+            "* ",
+            Style::default()
+                .fg(theme.branch_current)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else if worktree.is_some() {
+        (
+            "⎘ ",
+            Style::default()
+                .fg(theme.modified)
+                .add_modifier(Modifier::BOLD),
+        )
     } else {
-        Style::default().fg(theme.fg_dim)
+        ("  ", Style::default().fg(theme.fg_dim))
     };
+
     let name_style = if b.is_current {
         Style::default()
             .fg(theme.branch_current)
             .add_modifier(Modifier::BOLD)
+    } else if worktree.is_some() {
+        // Branches locked to another worktree: dim and italic so they read as
+        // "you can't check this out from here".
+        Style::default()
+            .fg(theme.fg_dim)
+            .add_modifier(Modifier::ITALIC)
     } else {
         Style::default().fg(theme.fg)
     };
@@ -71,22 +102,39 @@ fn branch_line<'a>(b: &'a Branch, pr: Option<&'a Pr>, width: u16, theme: &Theme)
         Span::styled(b.name.as_str(), name_style),
     ];
 
+    // Compose right-side text: track + PR chip + worktree hint
     let track = format_track(b);
     let pr_chip = pr.map(pr_chip_text);
-    let right_text = match (track.as_str(), pr_chip.as_ref()) {
-        ("", None) => String::new(),
-        ("", Some(c)) => c.text.clone(),
-        (t, None) => t.to_string(),
-        (t, Some(c)) => format!("{t} {}", c.text),
-    };
+    let wt_hint = worktree.map(|p| short_path(p));
 
-    let used = 2 + b.name.chars().count() + right_text.chars().count();
+    let right_text_len: usize = [
+        track.chars().count(),
+        pr_chip.as_ref().map(|c| c.text.chars().count()).unwrap_or(0),
+        wt_hint.as_ref().map(|s| s.chars().count() + 4).unwrap_or(0), // " wt:"
+    ]
+    .iter()
+    .filter(|n| **n > 0)
+    .map(|n| *n + 1) // separators
+    .sum();
+
+    let used = 2 + b.name.chars().count() + right_text_len;
     let pad = (width as usize).saturating_sub(used + 3);
     if pad > 0 {
         spans.push(Span::raw(" ".repeat(pad)));
     } else {
         spans.push(Span::raw(" "));
     }
+
+    if let Some(s) = wt_hint {
+        spans.push(Span::styled(
+            format!("⎘ {s}"),
+            Style::default()
+                .fg(theme.modified)
+                .add_modifier(Modifier::DIM),
+        ));
+        spans.push(Span::raw(" "));
+    }
+
     if !track.is_empty() {
         spans.push(Span::styled(track, Style::default().fg(theme.accent)));
         if pr_chip.is_some() {
@@ -114,6 +162,22 @@ fn format_track(b: &Branch) -> String {
         s.push_str(&format!("↓{}", b.behind));
     }
     s
+}
+
+/// Turn an absolute worktree path into a compact form for the branches pane.
+/// Show last 2 path components: `…/repo-foo/wt-bar`. Avoids leaking $HOME.
+fn short_path(p: &PathBuf) -> String {
+    let comps: Vec<_> = p.components().collect();
+    let n = comps.len();
+    if n <= 2 {
+        return p.display().to_string();
+    }
+    let last_two = comps[n - 2..]
+        .iter()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
+    format!("…/{last_two}")
 }
 
 struct Chip {
