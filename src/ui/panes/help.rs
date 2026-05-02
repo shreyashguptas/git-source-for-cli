@@ -117,6 +117,13 @@ fn build_lines(theme: &Theme) -> Vec<Line<'static>> {
         row("Enter", "submit commit (or create branch when prefixed with 'branch:')"),
         row("Esc", "cancel"),
         row("← →  Home End  Backspace", "edit input"),
+        row("Ctrl-G", "(re)generate the commit message via Ollama"),
+        Line::from(""),
+        head("Ollama (local AI commit messages)"),
+        row("Ctrl-G", "stage some files, then press Ctrl-G — Ollama writes the subject"),
+        row("M", "open model picker (lists installed models; saves choice to ~/.config/gsc)"),
+        row("status bar", "shows ollama: ✓ <model> when reachable; ✗ when not running"),
+        row("config", "~/.config/gsc/config.json (base_url, model, system_prompt)"),
     ]
 }
 

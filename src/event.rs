@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use crate::{
     gh::{Availability, Pr},
     git::{Branch, Commit, HeadRef, Status},
+    ollama::Availability as OllamaAvailability,
     ui::panes::details::DetailsContent,
 };
 
@@ -37,6 +38,17 @@ pub enum AppEvent {
     PreviewLoaded(String, DetailsContent),
     /// A background load failed — message is the user-facing one-liner.
     LoadFailed(String),
+
+    /// Probe of the local Ollama instance — null when unreachable, otherwise
+    /// includes the list of installed models.
+    OllamaAvailability(OllamaAvailability),
+    /// One streamed token from a commit-message generation.
+    OllamaToken(String),
+    /// Streaming finished cleanly. The full assembled message is included so
+    /// the input handler can do final cleanup (trim, take first line, etc.).
+    OllamaDone(String),
+    /// Streaming failed — message is the user-facing one-liner.
+    OllamaError(String),
 }
 
 /// Spawn the crossterm input + tick + signal tasks.
