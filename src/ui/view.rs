@@ -12,6 +12,10 @@ use crate::{
     ui::{panes, theme},
 };
 
+/// Threshold below which the inline preview pane is hidden so the other panes
+/// stay readable on narrow terminals.
+const PREVIEW_MIN_WIDTH: u16 = 130;
+
 /// Top-level render. Always called from the UI thread, never blocks.
 pub fn render(app: &mut App, frame: &mut Frame) {
     let theme = theme::current();
@@ -57,10 +61,25 @@ pub fn render(app: &mut App, frame: &mut Frame) {
 }
 
 fn render_main(app: &mut App, frame: &mut Frame, area: Rect, theme: &theme::Theme) {
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
-        .split(area);
+    let show_preview = area.width >= PREVIEW_MIN_WIDTH;
+
+    let cols = if show_preview {
+        // Three columns: branches+changes (left), graph (middle), preview (right).
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(25),
+                Constraint::Percentage(35),
+                Constraint::Percentage(40),
+            ])
+            .split(area)
+    } else {
+        // Two columns (the original layout).
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
+            .split(area)
+    };
 
     let left = Layout::default()
         .direction(Direction::Vertical)
@@ -70,6 +89,10 @@ fn render_main(app: &mut App, frame: &mut Frame, area: Rect, theme: &theme::Them
     panes::branches::render(app, left[0], frame, theme);
     panes::changes::render(app, left[1], frame, theme);
     panes::graph::render(app, cols[1], frame, theme);
+
+    if show_preview {
+        panes::preview::render(app, cols[2], frame, theme);
+    }
 }
 
 fn render_status_bar(app: &App, frame: &mut Frame, area: Rect, theme: &theme::Theme) {
@@ -98,12 +121,26 @@ fn render_status_bar(app: &App, frame: &mut Frame, area: Rect, theme: &theme::Th
         Availability::NotAuthed => "gh: not authed",
         Availability::NotInstalled => "gh: ✗",
     };
+    let hints = pane_hints(app);
     let text = format!(
-        " gsc · {head_label}{track_label} · {} changes · {gh_label} · pane: {pane_label}{mode_label} · ? help · q quit ",
+        " gsc · {head_label}{track_label} · {} changes · {gh_label} · {pane_label}{mode_label} · {hints} · ? help · q quit ",
         app.status.files.len(),
     );
     let bar = Paragraph::new(Span::raw(text)).style(theme.status_bar());
     frame.render_widget(bar, area);
+}
+
+/// Pane-specific keybinding hints shown in the status bar — discoverability
+/// for the most common actions without opening the help overlay.
+fn pane_hints(app: &App) -> &'static str {
+    if app.input_mode == InputMode::Commit {
+        return "Enter commit · Esc cancel";
+    }
+    match app.active_pane {
+        Pane::Branches => "Enter checkout · n new · p push · P pull · m merge · d del",
+        Pane::Changes => "Space stage · a all · c commit · C commit+push · x discard",
+        Pane::Graph => "↑↓ live preview · Enter full · o github",
+    }
 }
 
 fn render_toast(app: &App, frame: &mut Frame, area: Rect, theme: &theme::Theme) {

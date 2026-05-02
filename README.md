@@ -1,21 +1,25 @@
 # gsc — git source control TUI
 
-VS Code's Source Control panel + Git Graph extension, in your terminal. One short command, three panes, full keyboard control.
+VS Code's Source Control panel + Git Graph extension, in your terminal. One short command, four panes, full keyboard control. Live diff preview that updates as you arrow through commits.
 
 ```
-┌─ Branches (5) ──────────────────┬─ Graph (12 commits) ────────────────────────┐
-│ * main                ↑2 ↓0     │ ●─╮  acdea64  HEAD → main   Merge feature   │
-│   feature             +2 PR#41  │ ● │  3ecf7a8  main: more readme             │
-│   wip                           │ │ ●  424b277  feat: more                    │
-│                                 │ │ ●  5cce256  feat: add feature.md          │
-│                                 │ ●─╯  b628217  second                        │
-│                                 │ ●     f957320  init                          │
-├─ Changes (2) ───────────────────┤                                              │
-│ ● A staged.md                   │                                              │
-│ ○ ? work.txt                    │                                              │
-└─────────────────────────────────┴──────────────────────────────────────────────┘
- gsc · main · 2 changes · gh: ✓ · pane: branches · ? help · q quit
+┌─ Branches (3) ───────┬─ Graph (12 commits) ───────────────┬─ Preview · 3ecf7a8 main: more readme ────┐
+│ * main      ↑2 ↓0    │ ●─╮  acdea64  HEAD → main          │ commit 3ecf7a8...                         │
+│   feature   +2 PR#41 │ ● │  3ecf7a8  main: more readme  ←│ Author: Shreyash Gupta                    │
+│   wip                │ │ ●  424b277  feat: more            │ Date:   2026-05-01 18:42                  │
+│                      │ │ ●  5cce256  feat: add feature.md  │                                           │
+├─ Changes (2) ────────┤ ●─╯  b628217  second                │     main: more readme                     │
+│ ● A staged.md        │ ●     f957320  init                  │                                           │
+│ ○ ? work.txt         │                                      │ diff --git a/README.md b/README.md        │
+│                      │                                      │ @@ -1,2 +1,3 @@                           │
+│                      │                                      │  hello                                    │
+│                      │                                      │  v2                                       │
+│                      │                                      │ +main work                                │
+└──────────────────────┴──────────────────────────────────────┴───────────────────────────────────────────┘
+ gsc · main · 2 changes · gh: ✓ · graph · ↑↓ live preview · Enter full · o github · ? help · q quit
 ```
+
+**The big idea**: arrow up/down on the Graph (or Changes) pane and the right-side Preview updates instantly. No clicking. No modal popups for casual browsing — `Enter` opens the full-screen view only when you want more room to scroll.
 
 ## Install
 
@@ -95,8 +99,12 @@ gsc --help
 **Graph pane**
 | Key | Action |
 |---|---|
-| `Enter` | view full commit + diff |
+| `↑↓` `j k` | scroll — Preview pane (right column) updates automatically |
+| `Enter` | open the diff full-screen (more room to scroll) |
 | `o` | open commit on github.com |
+
+**Preview pane (right column)**
+The Preview pane updates automatically as the Graph or Changes selection moves — no keystrokes needed. It shows the file diff (Changes pane) or `git show` output (Graph pane) for whatever's currently selected. Hides automatically when the terminal is narrower than 130 cols.
 
 ## What `gsc` is — and isn't
 

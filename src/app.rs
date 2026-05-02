@@ -80,6 +80,13 @@ pub struct App {
     pub overlay: Option<DetailsContent>,
     pub overlay_scroll: u16,
 
+    /// Inline live preview (third column).
+    pub preview: Option<DetailsContent>,
+    pub preview_scroll: u16,
+    /// Identity of the thing currently being previewed — sha for commits,
+    /// "file:<staged>:<path>" for changes. Used to discard stale fetches.
+    pub preview_target: Option<String>,
+
     pub show_help: bool,
 
     pub confirm: Option<ConfirmDialog>,
@@ -111,6 +118,9 @@ impl App {
             should_quit: false,
             overlay: None,
             overlay_scroll: 0,
+            preview: None,
+            preview_scroll: 0,
+            preview_target: None,
             show_help: false,
             confirm: None,
             gh: Availability::NotInstalled,
@@ -157,15 +167,24 @@ impl App {
             AppEvent::CommitsLoaded(c) => {
                 clamp_selection(&mut self.graph_state, c.len());
                 self.commits = c;
+                self.update_preview();
             }
             AppEvent::StatusLoaded(s) => {
                 clamp_selection(&mut self.changes_state, s.files.len());
                 self.status = s;
+                self.update_preview();
             }
             AppEvent::OverlayLoaded(c) => {
                 if self.overlay.is_some() {
                     self.overlay = Some(c);
                     self.overlay_scroll = 0;
+                }
+            }
+            AppEvent::PreviewLoaded(target, content) => {
+                // Only adopt if the user hasn't moved on to a different commit/file.
+                if self.preview_target.as_deref() == Some(target.as_str()) {
+                    self.preview = Some(content);
+                    self.preview_scroll = 0;
                 }
             }
             AppEvent::GhAvailability(a) => {
@@ -249,12 +268,27 @@ impl App {
         match key.code {
             KeyCode::Char('?') => self.show_help = true,
             KeyCode::Char('q') => self.should_quit = true,
-            KeyCode::Tab => self.active_pane = self.active_pane.next(),
-            KeyCode::BackTab => self.active_pane = self.active_pane.prev(),
+            KeyCode::Tab => {
+                self.active_pane = self.active_pane.next();
+                self.update_preview();
+            }
+            KeyCode::BackTab => {
+                self.active_pane = self.active_pane.prev();
+                self.update_preview();
+            }
             KeyCode::Char('r') => self.spawn_refresh(),
-            KeyCode::Char('1') => self.active_pane = Pane::Branches,
-            KeyCode::Char('2') => self.active_pane = Pane::Changes,
-            KeyCode::Char('3') => self.active_pane = Pane::Graph,
+            KeyCode::Char('1') => {
+                self.active_pane = Pane::Branches;
+                self.update_preview();
+            }
+            KeyCode::Char('2') => {
+                self.active_pane = Pane::Changes;
+                self.update_preview();
+            }
+            KeyCode::Char('3') => {
+                self.active_pane = Pane::Graph;
+                self.update_preview();
+            }
             KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
             KeyCode::Char('g') | KeyCode::Home => self.move_selection_to(0),
@@ -744,6 +778,7 @@ impl App {
         let cur = state.selected().unwrap_or(0) as isize;
         let next = (cur + delta).clamp(0, len as isize - 1) as usize;
         state.select(Some(next));
+        self.update_preview();
     }
 
     fn move_selection_to(&mut self, target: isize) {
@@ -753,6 +788,7 @@ impl App {
         }
         let next = target.clamp(0, len as isize - 1) as usize;
         state.select(Some(next));
+        self.update_preview();
     }
 
     fn active_state_and_len(&mut self) -> (&mut ListState, usize) {
@@ -760,6 +796,86 @@ impl App {
             Pane::Branches => (&mut self.branches_state, self.branches.len()),
             Pane::Changes => (&mut self.changes_state, self.status.files.len()),
             Pane::Graph => (&mut self.graph_state, self.commits.len()),
+        }
+    }
+
+    /// Compute (target_id, title, fetch_future) for the current pane+selection.
+    /// Returns None when there's nothing to preview (e.g. on Branches pane).
+    fn current_preview_request(&self) -> Option<(String, String, BoxedFetch)> {
+        match self.active_pane {
+            Pane::Graph => {
+                let idx = self.graph_state.selected()?;
+                let commit = self.commits.get(idx)?;
+                let target = format!("sha:{}", &commit.hash);
+                let title = format!("{} {}", &commit.short_hash, &commit.subject);
+                let sha = commit.hash.clone();
+                let root = self.repo.root.clone();
+                Some((
+                    target,
+                    title,
+                    Box::pin(async move { git::diff::show(&root, &sha).await }),
+                ))
+            }
+            Pane::Changes => {
+                let idx = self.changes_state.selected()?;
+                let file = self.status.files.get(idx)?;
+                let staged = file.staged.is_some() && file.unstaged.is_none();
+                let target = format!("file:{}:{}", staged as u8, &file.path);
+                let title = match (&file.from, file.kind) {
+                    (Some(f), _) => format!("{f} → {}", &file.path),
+                    _ => file.path.clone(),
+                };
+                let path = file.path.clone();
+                let kind = file.kind;
+                let root = self.repo.root.clone();
+                Some((
+                    target,
+                    title,
+                    Box::pin(async move {
+                        match kind {
+                            ChangeKind::Untracked => git::diff::untracked(&root, &path).await,
+                            _ => git::diff::file(&root, &path, staged).await,
+                        }
+                    }),
+                ))
+            }
+            Pane::Branches => None,
+        }
+    }
+
+    /// Inspect the current pane+selection and update the inline preview if the
+    /// target changed. Cheap when target is the same (no fetch spawned).
+    fn update_preview(&mut self) {
+        let request = self.current_preview_request();
+        match request {
+            None => {
+                // No valid target — clear the preview.
+                self.preview = None;
+                self.preview_target = None;
+                self.preview_scroll = 0;
+            }
+            Some((target, title, fetch)) => {
+                if self.preview_target.as_deref() == Some(target.as_str()) {
+                    return; // already showing this
+                }
+                self.preview_target = Some(target.clone());
+                self.preview = Some(DetailsContent::Loading {
+                    title: title.clone(),
+                });
+                self.preview_scroll = 0;
+
+                let tx = self.events_tx.clone();
+                tokio::spawn(async move {
+                    let content = match fetch.await {
+                        Ok(body) => DetailsContent::Body { title, body },
+                        Err(e) => DetailsContent::Error {
+                            title,
+                            message: format!("{e}"),
+                        },
+                    };
+                    let _ = tx.send(AppEvent::PreviewLoaded(target, content)).await;
+                });
+            }
         }
     }
 

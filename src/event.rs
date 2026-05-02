@@ -28,6 +28,9 @@ pub enum AppEvent {
     PrsLoaded(HashMap<String, Pr>),
     /// Async-loaded body for the details overlay.
     OverlayLoaded(DetailsContent),
+    /// Async-loaded body for the inline preview pane. The first field is the
+    /// target identity (sha or file:path) so stale fetches can be discarded.
+    PreviewLoaded(String, DetailsContent),
     /// A background load failed — message is the user-facing one-liner.
     LoadFailed(String),
 }

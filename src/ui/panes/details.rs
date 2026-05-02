@@ -1,5 +1,8 @@
 //! Modal overlay for diff/commit details viewing.
 //! Renders a full-screen panel with a scrollable colored diff.
+//!
+//! This module also exposes `lines_from_content` and `line_style` so the inline
+//! `preview` pane can share the diff line styling.
 
 use ratatui::{
     layout::{Margin, Rect},
@@ -11,7 +14,7 @@ use ratatui::{
 
 use crate::{git::diff::{classify, DiffLineKind}, ui::theme::Theme};
 
-/// What's being shown in the overlay.
+/// What's being shown in the overlay (or preview pane).
 #[derive(Debug, Clone)]
 pub enum DetailsContent {
     /// Loading state — the body fetch is in flight.
@@ -63,24 +66,7 @@ pub fn render(
     let inner = modal.inner(Margin { vertical: 1, horizontal: 2 });
     frame.render_widget(block, modal);
 
-    let lines: Vec<Line<'_>> = match content {
-        DetailsContent::Loading { .. } => vec![Line::from(Span::styled(
-            "loading…",
-            Style::default().fg(theme.fg_dim),
-        ))],
-        DetailsContent::Error { message, .. } => vec![Line::from(Span::styled(
-            message.as_str(),
-            Style::default().fg(theme.error),
-        ))],
-        DetailsContent::Body { body, .. } => body
-            .lines()
-            .map(|l| {
-                let kind = classify(l);
-                Line::from(Span::styled(l, line_style(kind, theme)))
-            })
-            .collect(),
-    };
-
+    let lines = lines_from_content(content, theme);
     let total = lines.len();
     let para = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
@@ -100,7 +86,28 @@ pub fn render(
     }
 }
 
-fn line_style(kind: DiffLineKind, theme: &Theme) -> Style {
+/// Convert a `DetailsContent` into colored Lines. Reused by the inline preview pane.
+pub fn lines_from_content<'a>(content: &'a DetailsContent, theme: &Theme) -> Vec<Line<'a>> {
+    match content {
+        DetailsContent::Loading { .. } => vec![Line::from(Span::styled(
+            "loading…",
+            Style::default().fg(theme.fg_dim),
+        ))],
+        DetailsContent::Error { message, .. } => vec![Line::from(Span::styled(
+            message.as_str(),
+            Style::default().fg(theme.error),
+        ))],
+        DetailsContent::Body { body, .. } => body
+            .lines()
+            .map(|l| {
+                let kind = classify(l);
+                Line::from(Span::styled(l, line_style(kind, theme)))
+            })
+            .collect(),
+    }
+}
+
+pub fn line_style(kind: DiffLineKind, theme: &Theme) -> Style {
     match kind {
         DiffLineKind::Add => Style::default().fg(theme.added),
         DiffLineKind::Del => Style::default().fg(theme.deleted),
