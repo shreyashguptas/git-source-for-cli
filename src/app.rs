@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     future::Future,
     io,
+    path::PathBuf,
     pin::Pin,
     time::Duration,
 };
@@ -68,10 +69,52 @@ pub enum InputMode {
 /// to hit-test clicks. Updated by the view code on every render.
 #[derive(Debug, Clone, Default)]
 pub struct PaneRects {
+    /// The full main-content area used by the panes (excludes status bar /
+    /// commit input / toast). Useful for mouse-drag clamping.
+    pub main_area: Rect,
     pub branches: Rect,
     pub changes: Rect,
     pub graph: Rect,
     pub preview: Option<Rect>,
+}
+
+/// User-driven width/height overrides for the layout. Stored in absolute
+/// columns/rows; clamped to sane mins on each render. `None` means "use the
+/// default proportion".
+#[derive(Debug, Clone, Default)]
+pub struct LayoutOverrides {
+    /// Width of the left column (Branches + Changes).
+    pub left_width: Option<u16>,
+    /// Width of the Graph column (only meaningful when preview is shown).
+    pub graph_width: Option<u16>,
+    /// Height of the Branches pane within the left column.
+    pub branches_height: Option<u16>,
+}
+
+/// Which splitter the user is currently dragging, if any.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ResizeDrag {
+    #[default]
+    None,
+    /// Vertical splitter between the left column and the Graph column.
+    LeftGraph,
+    /// Vertical splitter between the Graph and Preview columns.
+    GraphPreview,
+    /// Horizontal splitter between Branches and Changes inside the left column.
+    BranchesChanges,
+}
+
+/// Actions exposed as clickable buttons in the Branches pane toolbar.
+/// Same dispatch as the keyboard shortcuts (`Enter` / `n` / `p` / `P` / `f` / `m` / `d`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BranchAction {
+    Checkout,
+    NewBranch,
+    Push,
+    Pull,
+    Fetch,
+    Merge,
+    Delete,
 }
 
 /// Top-level application state.
@@ -119,6 +162,10 @@ pub struct App {
     /// Commits origin has but the local HEAD doesn't (i.e. unpulled).
     pub behind_shas: HashSet<String>,
 
+    /// Map of branch name → worktree path. Lets us flag branches that are
+    /// checked out in another worktree (which `git checkout` here would refuse).
+    pub worktrees: HashMap<String, PathBuf>,
+
     /// Most recent on-screen pane rectangles, written by `ui::view::render`.
     pub last_rects: PaneRects,
 
@@ -131,6 +178,16 @@ pub struct App {
     pub model_picker: Option<ModelPickerState>,
     /// Handle to the in-flight generation task — kept so Esc can abort it.
     pub gen_task: Option<tokio::task::JoinHandle<()>>,
+
+    /// User-driven sizing overrides — set by drag, read by the view.
+    pub layout_overrides: LayoutOverrides,
+    /// Active drag, if any. Set on left-button down over a splitter, cleared on up.
+    pub active_drag: ResizeDrag,
+
+    /// On-screen rects of the Branches-pane toolbar buttons, written each
+    /// render. Click handler hit-tests these to dispatch the corresponding
+    /// `BranchAction`.
+    pub branch_button_rects: Vec<(BranchAction, Rect)>,
 }
 
 impl App {
@@ -166,11 +223,15 @@ impl App {
             prs_last_refresh: std::time::Instant::now() - Duration::from_secs(3600),
             ahead_shas: HashSet::new(),
             behind_shas: HashSet::new(),
+            worktrees: HashMap::new(),
             last_rects: PaneRects::default(),
             config,
             ollama: OllamaAvailability::Unknown,
             model_picker: None,
             gen_task: None,
+            layout_overrides: LayoutOverrides::default(),
+            active_drag: ResizeDrag::None,
+            branch_button_rects: Vec::new(),
         };
         s.branches_state.select(Some(0));
         s.changes_state.select(Some(0));
@@ -223,6 +284,9 @@ impl App {
             AppEvent::DivergenceLoaded { ahead, behind } => {
                 self.ahead_shas = ahead;
                 self.behind_shas = behind;
+            }
+            AppEvent::WorktreesLoaded(map) => {
+                self.worktrees = map;
             }
             AppEvent::OverlayLoaded(c) => {
                 if self.overlay.is_some() {
@@ -396,6 +460,11 @@ impl App {
                 self.update_preview();
             }
             KeyCode::Char('r') => self.spawn_refresh(),
+            // `=` resets any drag-resized panes back to default proportions.
+            KeyCode::Char('=') => {
+                self.layout_overrides = crate::app::LayoutOverrides::default();
+                self.toast = Some("layout reset".to_string());
+            }
             KeyCode::Char('1') => {
                 self.active_pane = Pane::Branches;
                 self.update_preview();
@@ -546,8 +615,8 @@ impl App {
         Some(format!("{web}/commit/{sha}"))
     }
 
-    /// Mouse handling: left-click focuses + selects, scroll wheel scrolls.
-    /// Modal overlays consume scroll only; clicks on them do nothing (use Esc).
+    /// Mouse handling: left-click focuses + selects, scroll wheel scrolls,
+    /// drag on a pane border resizes the layout.
     fn handle_mouse(&mut self, ev: MouseEvent) {
         let pos = (ev.column, ev.row);
 
@@ -562,18 +631,20 @@ impl App {
             return;
         }
         if overlay_active {
-            // Help/confirm don't scroll; ignore mouse entirely.
             return;
         }
 
-        // Don't redirect mouse while typing a commit message — it shouldn't
-        // accidentally move selection mid-type.
+        // Don't redirect mouse while typing a commit message.
         if self.input_mode == InputMode::Commit {
             return;
         }
 
         match ev.kind {
             MouseEventKind::Down(MouseButton::Left) => self.handle_mouse_click(pos),
+            MouseEventKind::Drag(MouseButton::Left) => self.handle_mouse_drag(pos),
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.active_drag = ResizeDrag::None;
+            }
             MouseEventKind::ScrollUp => self.handle_mouse_scroll(pos, -3),
             MouseEventKind::ScrollDown => self.handle_mouse_scroll(pos, 3),
             _ => {}
@@ -581,7 +652,19 @@ impl App {
     }
 
     fn handle_mouse_click(&mut self, (x, y): (u16, u16)) {
-        // Clone rect copies because borrows below would clash with self.update_preview()
+        // First: did they grab a splitter? If so, start a drag and don't also
+        // select an item.
+        if let Some(drag) = self.detect_splitter(x, y) {
+            self.active_drag = drag;
+            return;
+        }
+
+        // Second: did they click a Branches-pane toolbar button?
+        if let Some(action) = self.detect_branch_button(x, y) {
+            self.run_branch_action(action);
+            return;
+        }
+
         let rects = self.last_rects.clone();
         if hit(rects.branches, x, y) {
             self.active_pane = Pane::Branches;
@@ -597,10 +680,97 @@ impl App {
             self.update_preview();
         } else if let Some(p) = rects.preview {
             if hit(p, x, y) {
-                // Clicking the preview pane just gives it scroll focus; we don't
-                // change the selected pane (the preview mirrors Graph/Changes).
-                // No-op for now.
+                // Preview clicks: no-op (it mirrors Graph/Changes selection).
             }
+        }
+    }
+
+    fn detect_branch_button(&self, x: u16, y: u16) -> Option<BranchAction> {
+        self.branch_button_rects
+            .iter()
+            .find(|(_, r)| hit(*r, x, y))
+            .map(|(a, _)| *a)
+    }
+
+    /// Did the click land exactly on a splitter (the actual border line)?
+    /// We hit-test on the two adjacent border columns/rows that visually form
+    /// the splitter — anything one cell INTO a pane is content, not splitter.
+    /// This avoids the bug where clicking the first row of Changes (or the
+    /// leftmost col of Graph) was eaten by drag-detection.
+    fn detect_splitter(&self, x: u16, y: u16) -> Option<ResizeDrag> {
+        let r = &self.last_rects;
+        if r.branches.width == 0 {
+            return None;
+        }
+
+        // Horizontal splitter inside the left column (Branches above Changes).
+        // The splitter visually sits on the two adjacent border rows:
+        //   - bottom border of Branches (last row of Branches rect)
+        //   - top border of Changes (first row of Changes rect)
+        if x >= r.branches.x && x < r.branches.x + r.branches.width {
+            let branches_bottom_border = r.branches.y + r.branches.height.saturating_sub(1);
+            let changes_top_border = r.changes.y;
+            if y == branches_bottom_border || y == changes_top_border {
+                return Some(ResizeDrag::BranchesChanges);
+            }
+        }
+
+        // Vertical splitters require y inside the panes' vertical span.
+        let v_top = r.branches.y;
+        let v_bot = r.graph.y + r.graph.height;
+        if y < v_top || y >= v_bot {
+            return None;
+        }
+
+        // Vertical splitter between Left column and Graph: the rightmost col
+        // of Branches/Changes (their right border) and the leftmost col of
+        // Graph (its left border) — both render as `│` and are valid hit cols.
+        let left_pane_right_border = r.branches.x + r.branches.width.saturating_sub(1);
+        let graph_left_border = r.graph.x;
+        if x == left_pane_right_border || x == graph_left_border {
+            return Some(ResizeDrag::LeftGraph);
+        }
+
+        // Vertical splitter between Graph and Preview.
+        if let Some(p) = r.preview {
+            let graph_right_border = r.graph.x + r.graph.width.saturating_sub(1);
+            let preview_left_border = p.x;
+            if x == graph_right_border || x == preview_left_border {
+                return Some(ResizeDrag::GraphPreview);
+            }
+        }
+        None
+    }
+
+    fn handle_mouse_drag(&mut self, (x, y): (u16, u16)) {
+        let area = self.last_rects.main_area;
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+
+        match self.active_drag {
+            ResizeDrag::LeftGraph => {
+                // Width of the left column = mouse x relative to its left edge.
+                let new_w = x.saturating_sub(area.x);
+                // Reserve at least 40 cols for graph (+ preview if present).
+                let max = area.width.saturating_sub(40);
+                self.layout_overrides.left_width = Some(new_w.clamp(15, max.max(15)));
+            }
+            ResizeDrag::GraphPreview => {
+                // Width of graph = mouse x relative to graph's left edge.
+                let new_w = x.saturating_sub(self.last_rects.graph.x);
+                let left_w = self.last_rects.branches.width;
+                let max = area.width.saturating_sub(left_w + 20);
+                self.layout_overrides.graph_width = Some(new_w.clamp(20, max.max(20)));
+            }
+            ResizeDrag::BranchesChanges => {
+                // Height of branches pane = mouse y relative to its top.
+                let new_h = y.saturating_sub(self.last_rects.branches.y);
+                // Leave at least 4 rows for changes pane below.
+                let max = area.height.saturating_sub(8);
+                self.layout_overrides.branches_height = Some(new_h.clamp(3, max.max(3)));
+            }
+            ResizeDrag::None => {}
         }
     }
 
@@ -1096,29 +1266,75 @@ impl App {
 
     async fn handle_enter(&mut self) {
         match self.active_pane {
-            Pane::Branches => {
-                if let Some(idx) = self.branches_state.selected() {
-                    if let Some(b) = self.branches.get(idx) {
-                        if b.is_current {
-                            return;
-                        }
-                        if !self.status.files.is_empty() {
-                            self.toast = Some(
-                                "checkout blocked: working tree has changes (commit/stash first)"
-                                    .to_string(),
-                            );
-                            return;
-                        }
-                        let name = b.name.clone();
-                        let root = self.repo.root.clone();
-                        self.run_op_async(
-                            &format!("checkout {name}"),
-                            Box::pin(async move { git::ops::checkout(&root, &name).await }),
-                        );
-                    }
-                }
-            }
+            Pane::Branches => self.checkout_selected_branch(),
             Pane::Changes | Pane::Graph => self.open_details().await,
+        }
+    }
+
+    /// Checkout the currently selected branch. Synchronous-callable so the
+    /// toolbar button can invoke it directly from the (sync) mouse handler.
+    fn checkout_selected_branch(&mut self) {
+        let Some(idx) = self.branches_state.selected() else {
+            return;
+        };
+        let Some(b) = self.branches.get(idx) else {
+            return;
+        };
+        if b.is_current {
+            self.toast = Some(format!("already on '{}'", b.name));
+            return;
+        }
+        if let Some(wt) = self.worktrees.get(&b.name) {
+            if wt != &self.repo.root {
+                self.toast = Some(format!(
+                    "'{}' is checked out in another worktree at {} — checkout blocked",
+                    b.name,
+                    wt.display()
+                ));
+                return;
+            }
+        }
+        if !self.status.files.is_empty() {
+            self.toast = Some(format!(
+                "checkout '{}' blocked: working tree has changes (commit / stash / discard first)",
+                b.name
+            ));
+            return;
+        }
+        let name = b.name.clone();
+        let root = self.repo.root.clone();
+        self.run_op_async(
+            &format!("checkout {name}"),
+            Box::pin(async move { git::ops::checkout(&root, &name).await }),
+        );
+    }
+
+    /// Dispatch a Branches-pane action — same effect as the matching keyboard
+    /// shortcut. Used by toolbar button clicks.
+    pub fn run_branch_action(&mut self, action: BranchAction) {
+        // Make sure the user's mental model matches: clicking a button focuses
+        // the Branches pane.
+        self.active_pane = Pane::Branches;
+        match action {
+            BranchAction::Checkout => self.checkout_selected_branch(),
+            BranchAction::NewBranch => self.start_new_branch(),
+            BranchAction::Push => self.spawn_push(),
+            BranchAction::Pull => self.run_op_async(
+                "pull --ff-only",
+                Box::pin({
+                    let r = self.repo.root.clone();
+                    async move { git::ops::pull(&r).await }
+                }),
+            ),
+            BranchAction::Fetch => self.run_op_async(
+                "fetch --all",
+                Box::pin({
+                    let r = self.repo.root.clone();
+                    async move { git::ops::fetch_all(&r).await }
+                }),
+            ),
+            BranchAction::Merge => self.confirm_merge(),
+            BranchAction::Delete => self.confirm_delete(false),
         }
     }
 
@@ -1380,6 +1596,15 @@ impl App {
             let ahead = git::log::ahead_of_upstream(&root).await;
             let behind = git::log::behind_upstream(&root).await;
             let _ = tx.send(AppEvent::DivergenceLoaded { ahead, behind }).await;
+        });
+
+        // Worktree map — for the "checked out elsewhere" indicator.
+        let tx = self.events_tx.clone();
+        let root = self.repo.root.clone();
+        tokio::spawn(async move {
+            if let Ok(map) = git::worktree::list(&root).await {
+                let _ = tx.send(AppEvent::WorktreesLoaded(map)).await;
+            }
         });
 
         // PR refresh: throttled to once per 60s.
