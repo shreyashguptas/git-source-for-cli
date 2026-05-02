@@ -87,6 +87,7 @@ fn build_lines(theme: &Theme) -> Vec<Line<'static>> {
         Line::from(""),
         head("Branches pane"),
         row("toolbar", "click [checkout] [+ new] [push] [pull] [fetch] [merge] [delete]"),
+        row("↑↓ / j k", "preview selected branch/worktree in the Graph pane"),
         row("Enter", "checkout selected branch (same as [checkout] button)"),
         row("n", "new branch (type name, press Enter) — same as [+ new]"),
         row("d / D", "delete (safe / force) — confirms (same as [delete])"),

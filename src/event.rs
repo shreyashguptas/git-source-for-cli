@@ -27,11 +27,18 @@ pub enum AppEvent {
 
     HeadLoaded(HeadRef),
     BranchesLoaded(Vec<Branch>),
-    CommitsLoaded(Vec<Commit>),
+    CommitsLoaded {
+        request_id: u64,
+        commits: Vec<Commit>,
+    },
     StatusLoaded(Status),
     /// SHAs of commits that are local-only vs HEAD's upstream (`@{upstream}..HEAD`)
     /// and the inverse (`HEAD..@{upstream}`). Empty when there's no upstream.
-    DivergenceLoaded { ahead: HashSet<String>, behind: HashSet<String> },
+    DivergenceLoaded {
+        request_id: u64,
+        ahead: HashSet<String>,
+        behind: HashSet<String>,
+    },
     /// Map of branch name → worktree path (for branches checked out elsewhere).
     WorktreesLoaded(HashMap<String, PathBuf>),
     GhAvailability(Availability),

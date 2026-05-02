@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     future::Future,
     io,
-    path::PathBuf,
+    path::{Path, PathBuf},
     pin::Pin,
     time::Duration,
 };
@@ -125,6 +125,12 @@ pub struct App {
     pub head: HeadRef,
     pub branches: Vec<Branch>,
     pub commits: Vec<Commit>,
+    /// Branch whose history is currently shown in the Graph pane. Selection in
+    /// Branches changes this source without checking anything out.
+    pub graph_branch: Option<String>,
+    pub graph_upstream: Option<String>,
+    pub graph_root: PathBuf,
+    pub graph_request_id: u64,
     pub status: Status,
 
     pub branches_state: ListState,
@@ -193,6 +199,11 @@ pub struct App {
 impl App {
     pub async fn new(repo: Repo, events_tx: mpsc::Sender<AppEvent>) -> Result<Self> {
         let head = repo.head().await.unwrap_or(HeadRef::Unborn);
+        let graph_branch = match &head {
+            HeadRef::Branch(name) => Some(name.clone()),
+            _ => None,
+        };
+        let graph_root = repo.root.clone();
         let config = config::load();
         let mut s = Self {
             repo,
@@ -200,6 +211,10 @@ impl App {
             head,
             branches: Vec::new(),
             commits: Vec::new(),
+            graph_branch,
+            graph_upstream: None,
+            graph_root,
+            graph_request_id: 0,
             status: Status::default(),
             branches_state: ListState::default(),
             changes_state: ListState::default(),
@@ -270,23 +285,40 @@ impl App {
             AppEvent::BranchesLoaded(b) => {
                 clamp_selection(&mut self.branches_state, b.len());
                 self.branches = b;
+                if self.sync_graph_source_to_branch_selection() {
+                    self.spawn_graph_refresh();
+                }
             }
-            AppEvent::CommitsLoaded(c) => {
-                clamp_selection(&mut self.graph_state, c.len());
-                self.commits = c;
-                self.update_preview();
+            AppEvent::CommitsLoaded {
+                request_id,
+                commits,
+            } => {
+                if request_id == self.graph_request_id {
+                    clamp_selection(&mut self.graph_state, commits.len());
+                    self.commits = commits;
+                    self.update_preview();
+                }
             }
             AppEvent::StatusLoaded(s) => {
                 clamp_selection(&mut self.changes_state, s.files.len());
                 self.status = s;
                 self.update_preview();
             }
-            AppEvent::DivergenceLoaded { ahead, behind } => {
-                self.ahead_shas = ahead;
-                self.behind_shas = behind;
+            AppEvent::DivergenceLoaded {
+                request_id,
+                ahead,
+                behind,
+            } => {
+                if request_id == self.graph_request_id {
+                    self.ahead_shas = ahead;
+                    self.behind_shas = behind;
+                }
             }
             AppEvent::WorktreesLoaded(map) => {
                 self.worktrees = map;
+                if self.sync_graph_source_to_branch_selection() {
+                    self.spawn_graph_refresh();
+                }
             }
             AppEvent::OverlayLoaded(c) => {
                 if self.overlay.is_some() {
@@ -453,10 +485,16 @@ impl App {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Tab => {
                 self.active_pane = self.active_pane.next();
+                if self.active_pane == Pane::Branches {
+                    self.refresh_graph_for_selected_branch();
+                }
                 self.update_preview();
             }
             KeyCode::BackTab => {
                 self.active_pane = self.active_pane.prev();
+                if self.active_pane == Pane::Branches {
+                    self.refresh_graph_for_selected_branch();
+                }
                 self.update_preview();
             }
             KeyCode::Char('r') => self.spawn_refresh(),
@@ -467,6 +505,7 @@ impl App {
             }
             KeyCode::Char('1') => {
                 self.active_pane = Pane::Branches;
+                self.refresh_graph_for_selected_branch();
                 self.update_preview();
             }
             KeyCode::Char('2') => {
@@ -587,7 +626,7 @@ impl App {
                 let Some(commit) = self.commits.get(idx) else {
                     return;
                 };
-                self.commit_url(&commit.hash)
+                self.commit_url(&self.graph_root, &commit.hash)
             }
             Pane::Changes => None,
         };
@@ -599,11 +638,11 @@ impl App {
     }
 
     /// Best-effort: derive a github.com commit URL from the `origin` remote.
-    fn commit_url(&self, sha: &str) -> Option<String> {
+    fn commit_url(&self, root: &Path, sha: &str) -> Option<String> {
         // We synchronously read `git remote get-url origin` here — it's a one-shot
         // cheap call. If it fails or doesn't look like GitHub, return None.
         let out = std::process::Command::new("git")
-            .current_dir(&self.repo.root)
+            .current_dir(root)
             .args(["remote", "get-url", "origin"])
             .output()
             .ok()?;
@@ -669,6 +708,7 @@ impl App {
         if hit(rects.branches, x, y) {
             self.active_pane = Pane::Branches;
             self.click_select_in_pane(rects.branches, y, Pane::Branches);
+            self.refresh_graph_for_selected_branch();
             self.update_preview();
         } else if hit(rects.changes, x, y) {
             self.active_pane = Pane::Changes;
@@ -1386,7 +1426,7 @@ impl App {
                 };
                 let title = format!("{} {}", &commit.short_hash, &commit.subject);
                 let sha = commit.hash.clone();
-                let root = self.repo.root.clone();
+                let root = self.graph_root.clone();
                 (
                     title,
                     Box::pin(async move { git::diff::show(&root, &sha).await }),
@@ -1421,7 +1461,7 @@ impl App {
         let cur = state.selected().unwrap_or(0) as isize;
         let next = (cur + delta).clamp(0, len as isize - 1) as usize;
         state.select(Some(next));
-        self.update_preview();
+        self.handle_selection_changed();
     }
 
     fn move_selection_to(&mut self, target: isize) {
@@ -1431,6 +1471,13 @@ impl App {
         }
         let next = target.clamp(0, len as isize - 1) as usize;
         state.select(Some(next));
+        self.handle_selection_changed();
+    }
+
+    fn handle_selection_changed(&mut self) {
+        if self.active_pane == Pane::Branches {
+            self.refresh_graph_for_selected_branch();
+        }
         self.update_preview();
     }
 
@@ -1449,10 +1496,10 @@ impl App {
             Pane::Graph => {
                 let idx = self.graph_state.selected()?;
                 let commit = self.commits.get(idx)?;
-                let target = format!("sha:{}", &commit.hash);
+                let target = format!("sha:{}:{}", self.graph_root.display(), &commit.hash);
                 let title = format!("{} {}", &commit.short_hash, &commit.subject);
                 let sha = commit.hash.clone();
-                let root = self.repo.root.clone();
+                let root = self.graph_root.clone();
                 Some((
                     target,
                     title,
@@ -1522,6 +1569,134 @@ impl App {
         }
     }
 
+    fn refresh_graph_for_selected_branch(&mut self) {
+        if self.sync_graph_source_to_branch_selection() {
+            self.spawn_graph_refresh();
+        }
+    }
+
+    fn sync_graph_source_to_branch_selection(&mut self) -> bool {
+        let (branch, upstream, root) = self.selected_graph_source();
+        if self.graph_branch == branch && self.graph_upstream == upstream && self.graph_root == root
+        {
+            return false;
+        }
+
+        self.graph_branch = branch;
+        self.graph_upstream = upstream;
+        self.graph_root = root;
+        self.commits.clear();
+        self.ahead_shas.clear();
+        self.behind_shas.clear();
+        self.graph_state.select(Some(0));
+        self.preview = None;
+        self.preview_target = None;
+        self.preview_scroll = 0;
+        true
+    }
+
+    fn selected_graph_source(&self) -> (Option<String>, Option<String>, PathBuf) {
+        if let Some(branch) = self.selected_branch() {
+            return self.graph_source_for_branch(branch);
+        }
+
+        match &self.head {
+            HeadRef::Branch(name) => {
+                if let Some(branch) = self.branches.iter().find(|b| b.name == *name) {
+                    self.graph_source_for_branch(branch)
+                } else {
+                    (
+                        Some(name.clone()),
+                        None,
+                        self.worktree_root_for_branch(name)
+                            .unwrap_or_else(|| self.repo.root.clone()),
+                    )
+                }
+            }
+            HeadRef::Detached(_) | HeadRef::Unborn => (None, None, self.repo.root.clone()),
+        }
+    }
+
+    fn selected_branch(&self) -> Option<&Branch> {
+        self.branches_state
+            .selected()
+            .and_then(|idx| self.branches.get(idx))
+    }
+
+    fn graph_source_for_branch(
+        &self,
+        branch: &Branch,
+    ) -> (Option<String>, Option<String>, PathBuf) {
+        (
+            Some(branch.name.clone()),
+            branch.upstream.clone(),
+            self.worktree_root_for_branch(&branch.name)
+                .unwrap_or_else(|| self.repo.root.clone()),
+        )
+    }
+
+    fn worktree_root_for_branch(&self, branch: &str) -> Option<PathBuf> {
+        self.worktrees.get(branch).cloned()
+    }
+
+    fn spawn_graph_refresh(&mut self) {
+        self.graph_request_id = self.graph_request_id.wrapping_add(1);
+        let request_id = self.graph_request_id;
+        let tx = self.events_tx.clone();
+        let root = self.graph_root.clone();
+        let branch = self.graph_branch.clone();
+        let upstream = self.graph_upstream.clone();
+        let label = branch
+            .as_deref()
+            .map(|b| format!("log {b}"))
+            .unwrap_or_else(|| "log".to_string());
+
+        tokio::spawn(async move {
+            let result = match branch.as_deref() {
+                Some(name) => git::log::fetch_branch(&root, name, upstream.as_deref(), 500).await,
+                None => git::log::fetch(&root, 500).await,
+            };
+            match result {
+                Ok(commits) => {
+                    let _ = tx
+                        .send(AppEvent::CommitsLoaded {
+                            request_id,
+                            commits,
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    let _ = tx.send(AppEvent::LoadFailed(format!("{label}: {e}"))).await;
+                }
+            }
+        });
+
+        let tx = self.events_tx.clone();
+        let root = self.graph_root.clone();
+        let branch = self.graph_branch.clone();
+        tokio::spawn(async move {
+            let (ahead, behind) = match branch.as_deref() {
+                Some(name) => {
+                    let ahead = git::log::ahead_of_branch(&root, name).await;
+                    let behind = git::log::behind_branch(&root, name).await;
+                    (ahead, behind)
+                }
+                None => {
+                    let ahead = git::log::ahead_of_upstream(&root).await;
+                    let behind = git::log::behind_upstream(&root).await;
+                    (ahead, behind)
+                }
+            };
+            let _ = tx
+                .send(AppEvent::DivergenceLoaded {
+                    request_id,
+                    ahead,
+                    behind,
+                })
+                .await;
+        });
+    }
+
     fn spawn_pr_refresh(&self) {
         let tx = self.events_tx.clone();
         let root = self.repo.root.clone();
@@ -1537,7 +1712,7 @@ impl App {
         });
     }
 
-    fn spawn_refresh(&self) {
+    fn spawn_refresh(&mut self) {
         let tx = self.events_tx.clone();
         let root = self.repo.root.clone();
         tokio::spawn(async move {
@@ -1553,18 +1728,8 @@ impl App {
             }
         });
 
-        let tx = self.events_tx.clone();
-        let root = self.repo.root.clone();
-        tokio::spawn(async move {
-            match git::log::fetch(&root, 500).await {
-                Ok(c) => {
-                    let _ = tx.send(AppEvent::CommitsLoaded(c)).await;
-                }
-                Err(e) => {
-                    let _ = tx.send(AppEvent::LoadFailed(format!("log: {e}"))).await;
-                }
-            }
-        });
+        self.sync_graph_source_to_branch_selection();
+        self.spawn_graph_refresh();
 
         let tx = self.events_tx.clone();
         let root = self.repo.root.clone();
@@ -1587,15 +1752,6 @@ impl App {
             if let Ok(h) = repo.head().await {
                 let _ = tx.send(AppEvent::HeadLoaded(h)).await;
             }
-        });
-
-        // Divergence vs upstream — what's local-only / unpulled. Cheap call.
-        let tx = self.events_tx.clone();
-        let root = self.repo.root.clone();
-        tokio::spawn(async move {
-            let ahead = git::log::ahead_of_upstream(&root).await;
-            let behind = git::log::behind_upstream(&root).await;
-            let _ = tx.send(AppEvent::DivergenceLoaded { ahead, behind }).await;
         });
 
         // Worktree map — for the "checked out elsewhere" indicator.

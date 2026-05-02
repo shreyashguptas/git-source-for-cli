@@ -61,7 +61,7 @@ fn hint_text(pane: Pane) -> &'static str {
     match pane {
         Pane::Graph => "Use ↑↓/jk to scroll commits — preview updates automatically.\nPress Enter for the full-screen view.",
         Pane::Changes => "Use ↑↓/jk to browse files — preview updates automatically.\nSpace stages, c starts a commit.",
-        Pane::Branches => "Switch to the Graph or Changes pane (Tab) to see a live preview here.",
+        Pane::Branches => "Branch selection updates the Graph pane. Switch to Graph or Changes for diff previews.",
     }
 }
 

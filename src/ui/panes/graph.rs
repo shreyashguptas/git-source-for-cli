@@ -8,7 +8,6 @@ use ratatui::{
 
 use crate::{
     app::{App, Pane},
-    git::HeadRef,
     graph,
     ui::theme::Theme,
 };
@@ -66,22 +65,14 @@ pub fn render(app: &mut App, area: Rect, frame: &mut Frame, theme: &Theme) {
 /// Build the graph title with the VS Code-style divergence summary:
 /// `Graph · main · ↑3 to push · ↓0 to pull · 12 commits`
 fn build_title(app: &App) -> String {
-    let branch = match &app.head {
-        HeadRef::Branch(b) => Some(b.as_str()),
-        HeadRef::Detached(_) => Some("(detached)"),
-        HeadRef::Unborn => None,
-    };
-    let upstream = app
-        .branches
-        .iter()
-        .find(|b| matches!(&app.head, HeadRef::Branch(name) if name == &b.name))
-        .and_then(|b| b.upstream.as_deref());
+    let branch = graph_branch_label(app);
+    let upstream = app.graph_upstream.as_deref();
 
     let total = app.commits.len();
     let ahead = app.ahead_shas.len();
     let behind = app.behind_shas.len();
 
-    match (branch, upstream) {
+    match (branch.as_deref(), upstream) {
         (Some(b), Some(up)) => {
             let mut sync_part = String::new();
             if ahead == 0 && behind == 0 {
@@ -101,6 +92,23 @@ fn build_title(app: &App) -> String {
         }
         (Some(b), None) => format!(" Graph · {b} (no upstream) · {total} commits "),
         (None, _) => format!(" Graph · {total} commits "),
+    }
+}
+
+fn graph_branch_label(app: &App) -> Option<String> {
+    let branch = app.graph_branch.as_deref()?;
+    if app.graph_root != app.repo.root {
+        let worktree = app
+            .graph_root
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("worktree");
+        return Some(format!("{branch} @ {worktree}"));
+    }
+    if matches!(&app.head, crate::git::HeadRef::Branch(current) if current == branch) {
+        Some(branch.to_string())
+    } else {
+        Some(format!("{branch} (selected)"))
     }
 }
 

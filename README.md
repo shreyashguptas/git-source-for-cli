@@ -26,7 +26,7 @@ VS Code's Source Control panel + Git Graph extension, in your terminal. One shor
 - `↑ ●` in the left margin: this commit is **ahead of origin** (will be pushed when you press `p`)
 - `↓ ●` in the left margin: this commit is **only on origin** (will arrive when you press `P`)
 
-**The big idea**: arrow up/down on the Graph (or Changes) pane and the right-side Preview updates instantly. No modal popups for casual browsing — `Enter` opens the full-screen view only when you want more room to scroll. Mouse works too: left-click any pane to focus + select, scroll wheel scrolls.
+**The big idea**: arrow up/down on Branches previews that branch/worktree in the Graph without checking it out. Arrow through the Graph (or Changes) pane and the right-side Preview updates instantly. No modal popups for casual browsing — `Enter` opens the full-screen view only when you want more room to scroll. Mouse works too: left-click any pane to focus + select, scroll wheel scrolls.
 
 **Origin sync at a glance**: the Graph header shows `main ↔ origin/main · ↑3 to push · ↓0 to pull` so you always know how far ahead/behind you are. Each unpushed commit gets a `↑` marker in the left margin.
 
@@ -102,6 +102,7 @@ gsc --help
 **Branches pane**
 | Key | Action |
 |---|---|
+| `↑↓` `j k` | preview selected branch/worktree in the Graph pane |
 | `Enter` | checkout selected branch |
 | `n` | new branch (type name → `Enter`) |
 | `d` / `D` | delete (safe / force) — confirms |

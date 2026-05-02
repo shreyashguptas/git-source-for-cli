@@ -234,7 +234,7 @@ fn pane_hints(app: &App) -> &'static str {
         return "Enter commit · ^G regenerate · Esc cancel";
     }
     match app.active_pane {
-        Pane::Branches => "Enter checkout · n new · p push · P pull · m merge · d del · M model",
+        Pane::Branches => "↑↓ graph preview · Enter checkout · n new · p push · P pull · m merge · d del",
         Pane::Changes => "Space stage · a all · c commit · ^G ai-commit · M model · x discard",
         Pane::Graph => "↑↓ live preview · Enter full · o github",
     }

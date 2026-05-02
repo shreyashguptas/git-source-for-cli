@@ -30,12 +30,47 @@ pub enum RefName {
 /// Fetch the commit DAG from `git log --all` in date order.
 /// Caps at `limit` commits to keep memory and rendering bounded.
 pub async fn fetch(repo_root: &Path, limit: usize) -> Result<Vec<Commit>> {
+    fetch_with_revs(repo_root, ["--all".to_string()], limit).await
+}
+
+/// Fetch history for a specific local branch without checking it out.
+/// Include its upstream when present so ahead/behind commits can both appear.
+pub async fn fetch_branch(
+    repo_root: &Path,
+    branch: &str,
+    upstream: Option<&str>,
+    limit: usize,
+) -> Result<Vec<Commit>> {
+    let mut revs = vec![branch.to_string()];
+    let has_upstream = upstream.filter(|s| !s.is_empty()).is_some();
+    if let Some(upstream) = upstream.filter(|s| !s.is_empty()) {
+        revs.push(upstream.to_string());
+    }
+    match fetch_with_revs(repo_root, revs, limit).await {
+        Ok(commits) => Ok(commits),
+        Err(e) if has_upstream => fetch_with_revs(repo_root, [branch.to_string()], limit)
+            .await
+            .map_err(|_| e),
+        Err(e) => Err(e),
+    }
+}
+
+async fn fetch_with_revs<I>(repo_root: &Path, revs: I, limit: usize) -> Result<Vec<Commit>>
+where
+    I: IntoIterator<Item = String>,
+{
     // %H hash, %h short, %P parents (space-separated), %s subject, %an author,
     // %at author-time-unix, %D refs decoration (no parens, comma-separated).
     let format = "%H%x00%h%x00%P%x00%s%x00%an%x00%at%x00%D";
     let pretty = format!("--pretty=format:{format}");
     let limit_arg = format!("-{limit}");
-    let args: [&str; 5] = ["log", "--all", "--date-order", &pretty, &limit_arg];
+    let mut args = vec![
+        "log".to_string(),
+        "--date-order".to_string(),
+        pretty,
+        limit_arg,
+    ];
+    args.extend(revs);
     let out = exec::run(repo_root, args)
         .await
         .context("git log failed")?;
@@ -53,12 +88,15 @@ pub async fn fetch(repo_root: &Path, limit: usize) -> Result<Vec<Commit>> {
 /// Returns an empty set if there's no upstream, no HEAD, or any other error
 /// (we don't want to spam the user with toast warnings on every refresh).
 pub async fn ahead_of_upstream(repo_root: &Path) -> HashSet<String> {
-    match exec::run_optional(
-        repo_root,
-        ["rev-list", "@{upstream}..HEAD", "--pretty=format:%H"],
-    )
-    .await
-    {
+    rev_list_set(repo_root, "@{upstream}..HEAD").await
+}
+
+pub async fn ahead_of_branch(repo_root: &Path, branch: &str) -> HashSet<String> {
+    rev_list_set(repo_root, &format!("{branch}@{{upstream}}..{branch}")).await
+}
+
+async fn rev_list_set(repo_root: &Path, range: &str) -> HashSet<String> {
+    match exec::run_optional(repo_root, ["rev-list", range, "--pretty=format:%H"]).await {
         Ok(Some(out)) => out
             .lines()
             // `--pretty=format:%H` emits both the format line AND a "commit X" line;
@@ -75,21 +113,11 @@ pub async fn ahead_of_upstream(repo_root: &Path) -> HashSet<String> {
 /// SHAs reachable from HEAD's upstream but NOT from HEAD — commits origin
 /// has that the local branch doesn't (i.e. behind).
 pub async fn behind_upstream(repo_root: &Path) -> HashSet<String> {
-    match exec::run_optional(
-        repo_root,
-        ["rev-list", "HEAD..@{upstream}", "--pretty=format:%H"],
-    )
-    .await
-    {
-        Ok(Some(out)) => out
-            .lines()
-            .filter(|l| !l.starts_with("commit "))
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .map(String::from)
-            .collect(),
-        _ => HashSet::new(),
-    }
+    rev_list_set(repo_root, "HEAD..@{upstream}").await
+}
+
+pub async fn behind_branch(repo_root: &Path, branch: &str) -> HashSet<String> {
+    rev_list_set(repo_root, &format!("{branch}..{branch}@{{upstream}}")).await
 }
 
 fn parse_line(line: &str) -> Option<Commit> {
