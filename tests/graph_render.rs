@@ -81,6 +81,53 @@ fn renders_simple_merge() {
 }
 
 #[test]
+fn renders_branch_and_remote_pills() {
+    // Three commits with various ref combinations:
+    //   newest: HEAD on main, also at origin/main, also tagged v1.0
+    //   middle: a local-only feature branch tip
+    //   oldest: a remote-only origin/abandoned branch (rare, but valid)
+    let cs = vec![
+        commit(
+            "aaaaaa",
+            &["bbbbbb"],
+            "release v1.0",
+            vec![
+                RefName::HeadAt("main".into()),
+                RefName::RemoteBranch("origin/main".into()),
+                RefName::Tag("v1.0".into()),
+            ],
+        ),
+        commit(
+            "bbbbbb",
+            &["cccccc"],
+            "wip on feature",
+            vec![RefName::LocalBranch("feature".into())],
+        ),
+        commit(
+            "cccccc",
+            &[],
+            "abandoned branch tip",
+            vec![RefName::RemoteBranch("origin/abandoned".into())],
+        ),
+    ];
+    let out = render_to_text(&cs);
+    println!("\n{out}");
+
+    let lines: Vec<&str> = out.lines().collect();
+    // HEAD pill should appear on the newest commit
+    assert!(lines[0].contains("◉ main"), "expected HEAD pill on row 0: {:?}", lines[0]);
+    // ☁ chip should appear when local + remote co-exist
+    assert!(lines[0].contains('☁'), "expected cloud chip on row 0: {:?}", lines[0]);
+    // Tag pill
+    assert!(lines[0].contains("▸ v1.0"), "expected tag pill on row 0: {:?}", lines[0]);
+    // Local-only branch
+    assert!(lines[1].contains("⎇ feature"), "expected local pill on row 1: {:?}", lines[1]);
+    assert!(!lines[1].contains('☁'), "row 1 has no remote, no cloud: {:?}", lines[1]);
+    // Remote-only branch
+    assert!(lines[2].contains("☁ origin/abandoned"), "expected remote pill on row 2: {:?}", lines[2]);
+}
+
+#[test]
 fn renders_long_diamond() {
     //   m (merges b1 and b2)
     //   b2 -> mid

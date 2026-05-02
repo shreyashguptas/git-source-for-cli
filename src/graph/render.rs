@@ -3,8 +3,10 @@
 //! Each lane occupies 2 terminal columns: the glyph + a spacer (which can
 //! become `─` for horizontal arms during merges/splits).
 
+use std::collections::HashMap;
+
 use ratatui::{
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::Span,
 };
 
@@ -67,11 +69,10 @@ pub fn row_spans<'a>(
     ));
     spans.push(Span::raw(" "));
 
-    // Refs (branches/tags pointing here)
-    for r in &commit.refs {
-        let (label, style) = ref_label(r, theme, is_head);
-        spans.push(Span::styled(label, style));
-        spans.push(Span::raw(" "));
+    // Refs (branches/tags pointing here) — VS Code-style pills.
+    let _ = is_head; // pill rendering decides this per-group from the refs themselves.
+    for span in render_ref_pills(&commit.refs, theme) {
+        spans.push(span);
     }
 
     // Subject + author
@@ -97,32 +98,153 @@ fn lane_key_for_cell(row: &Row, lane: usize) -> Option<&str> {
         .and_then(|opt| opt.as_deref())
 }
 
-fn ref_label(r: &RefName, theme: &Theme, is_head: bool) -> (String, Style) {
-    let bold = Style::default().add_modifier(Modifier::BOLD);
-    match r {
-        RefName::HeadAt(name) => (
-            format!(" HEAD → {name} "),
-            bold.fg(theme.branch_current).bg(theme.selection_bg(false)),
-        ),
-        RefName::Head => (
-            " HEAD ".to_string(),
-            bold.fg(theme.branch_current).bg(theme.selection_bg(false)),
-        ),
-        RefName::LocalBranch(name) => (
-            format!(" {name} "),
-            bold.fg(if is_head {
-                theme.branch_current
-            } else {
-                theme.accent
-            }),
-        ),
-        RefName::RemoteBranch(name) => (format!(" {name} "), Style::default().fg(theme.fg_dim)),
-        RefName::Tag(name) => (
-            format!(" tag:{name} "),
-            Style::default().fg(theme.modified).add_modifier(Modifier::ITALIC),
-        ),
-        RefName::Other(name) => (format!(" {name} "), Style::default().fg(theme.fg_dim)),
+/// One logical branch's presence at a commit — consolidates HEAD/local/remote
+/// refs that share the same branch name.
+#[derive(Debug, Default)]
+struct RefGroup {
+    name: String,
+    has_local: bool,
+    has_remote: bool,
+    is_head: bool,
+}
+
+/// Group a commit's refs by logical branch name. `origin/main` and `main`
+/// collapse into one group with `has_remote=true, has_local=true`.
+/// Returns (branch groups sorted with HEAD first, tag names sorted, bare-detached-HEAD flag).
+fn group_refs(refs: &[RefName]) -> (Vec<RefGroup>, Vec<String>, bool) {
+    let mut groups: HashMap<String, RefGroup> = HashMap::new();
+    let mut tags: Vec<String> = Vec::new();
+    let mut bare_head = false;
+
+    for r in refs {
+        match r {
+            RefName::HeadAt(name) => {
+                let g = groups.entry(name.clone()).or_insert_with(|| RefGroup {
+                    name: name.clone(),
+                    ..RefGroup::default()
+                });
+                g.has_local = true;
+                g.is_head = true;
+            }
+            RefName::Head => bare_head = true,
+            RefName::LocalBranch(name) => {
+                let g = groups.entry(name.clone()).or_insert_with(|| RefGroup {
+                    name: name.clone(),
+                    ..RefGroup::default()
+                });
+                g.has_local = true;
+            }
+            RefName::RemoteBranch(full) => {
+                // "origin/main" → "main"; "fork/feature/foo" → "feature/foo"
+                let logical = full
+                    .split_once('/')
+                    .map(|(_remote, rest)| rest.to_string())
+                    .unwrap_or_else(|| full.clone());
+                let g = groups.entry(logical.clone()).or_insert_with(|| RefGroup {
+                    name: logical,
+                    ..RefGroup::default()
+                });
+                g.has_remote = true;
+            }
+            RefName::Tag(name) => tags.push(name.clone()),
+            RefName::Other(_) => {}
+        }
     }
+
+    let mut groups: Vec<RefGroup> = groups.into_values().collect();
+    // HEAD branch first, then alphabetical.
+    groups.sort_by(|a, b| {
+        b.is_head
+            .cmp(&a.is_head)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    tags.sort();
+    (groups, tags, bare_head)
+}
+
+/// Build VS Code-style pills:
+/// - local branch  → coloured pill with `◉` (HEAD) or `⎇` (other local) + name
+/// - remote also   → adjacent dim pill with `☁`
+/// - remote-only   → single dim pill with `☁ origin/<name>`
+/// - tags          → italic pill with `▸ name`
+/// - detached HEAD → green pill `◉ HEAD`
+fn render_ref_pills(refs: &[RefName], theme: &Theme) -> Vec<Span<'static>> {
+    let (groups, tags, bare_head) = group_refs(refs);
+    let mut spans = Vec::new();
+
+    // True ink color used inside coloured pills so the text reads well on
+    // bright backgrounds. Slightly off-black so cursors / selection still pop.
+    let ink = Color::Rgb(0x10, 0x14, 0x18);
+
+    // Detached HEAD that isn't co-located with any branch label → standalone pill.
+    if bare_head && !groups.iter().any(|g| g.is_head) {
+        spans.push(Span::styled(
+            " ◉ HEAD ".to_string(),
+            Style::default()
+                .bg(theme.branch_current)
+                .fg(ink)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw(" "));
+    }
+
+    for g in groups {
+        // Pick a stable per-branch lane color for the local pill so different
+        // branches show up in different colours (matches the lane coloring).
+        let pill_bg = if g.is_head {
+            theme.branch_current
+        } else {
+            color::for_key(&g.name)
+        };
+
+        if g.has_local {
+            let icon = if g.is_head { "◉" } else { "⎇" };
+            spans.push(Span::styled(
+                format!(" {icon} {} ", g.name),
+                Style::default()
+                    .bg(pill_bg)
+                    .fg(ink)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else if g.has_remote {
+            // Remote-only — show with the cloud icon and the full origin path.
+            spans.push(Span::styled(
+                format!(" ☁ origin/{} ", g.name),
+                Style::default()
+                    .bg(theme.fg_dim)
+                    .fg(ink)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+
+        // If both local AND remote, append a tight cloud chip right next to
+        // the local pill (no gap) — this is the "synced to GitHub" indicator.
+        if g.has_local && g.has_remote {
+            spans.push(Span::styled(
+                " ☁ ".to_string(),
+                Style::default()
+                    .bg(theme.fg_dim)
+                    .fg(ink)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+
+        // Separator between distinct branch groups.
+        spans.push(Span::raw(" "));
+    }
+
+    for t in tags {
+        spans.push(Span::styled(
+            format!(" ▸ {t} "),
+            Style::default()
+                .bg(theme.modified)
+                .fg(ink)
+                .add_modifier(Modifier::ITALIC),
+        ));
+        spans.push(Span::raw(" "));
+    }
+
+    spans
 }
 
 /// Build the 2-char cells for a single row.
