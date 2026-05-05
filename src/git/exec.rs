@@ -48,3 +48,21 @@ where
         Ok(None)
     }
 }
+
+/// Run `git` and return stdout regardless of exit status. Required for
+/// commands like `git diff --no-index`, which exits 1 specifically when it
+/// produces output (i.e. when the two paths differ) — using `run` would treat
+/// that as a failure and discard the diff.
+pub async fn run_capture<I, S>(cwd: &Path, args: I) -> Result<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let output = Command::new("git")
+        .current_dir(cwd)
+        .args(args)
+        .output()
+        .await
+        .context("failed to spawn `git`")?;
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}

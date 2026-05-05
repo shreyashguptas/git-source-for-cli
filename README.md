@@ -17,73 +17,81 @@ VS Code's Source Control panel + Git Graph extension, in your terminal. One shor
  gsc · main · 2 changes · gh: ✓ · graph · ↑↓ live preview · Enter full · o github · ? help · q quit
 ```
 
-**Reading the graph at a glance**:
+## Quick start
+
+Copy-paste this. It installs `gsc` to `~/.cargo/bin/gsc` and runs it on the current repo.
+
+```sh
+git clone https://github.com/shreyashguptas/git-source-for-cli.git
+cd git-source-for-cli
+cargo install --path .
+gsc
+```
+
+That's it. From any git repo, just type `gsc`.
+
+**Don't have Rust yet?** Install it first (one command, ~1 min):
+
+```sh
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+Then re-open your shell (or `source $HOME/.cargo/env`) and run the four commands above.
+
+### Just want to try it without installing?
+
+```sh
+git clone https://github.com/shreyashguptas/git-source-for-cli.git
+cd git-source-for-cli
+cargo run --release
+```
+
+### Update to the latest version
+
+```sh
+cd git-source-for-cli
+git pull
+cargo install --path . --force
+```
+
+## Requirements
+
+- macOS or Linux
+- `git` 2.30+ on `$PATH`
+- A terminal with truecolor + Unicode (iTerm2, Ghostty, Warp, kitty, Alacritty, macOS Terminal, Windows Terminal — any modern one)
+- (Optional) [`gh`](https://cli.github.com) for PR / CI integration — `gsc` degrades gracefully if it's not installed
+
+## Reading the graph at a glance
+
 - `[ ◉ main ]` — coloured pill with the filled-circle icon: this is your **current HEAD**
 - `[ ⎇ feature ]` — coloured pill with the branch icon: a **local-only** branch
 - `☁` — cloud chip immediately after a pill: that branch is **also on origin** (in sync). No cloud = unpushed.
-- `[ ☁ origin/old ]` — standalone cloud pill: a branch that exists **only on origin** (you don't have it locally)
+- `[ ☁ origin/old ]` — standalone cloud pill: a branch that exists **only on origin**
 - `▸ v1.0` — italic pill: a **tag**
 - `↑ ●` in the left margin: this commit is **ahead of origin** (will be pushed when you press `p`)
 - `↓ ●` in the left margin: this commit is **only on origin** (will arrive when you press `P`)
 
-**The big idea**: arrow up/down on Branches previews that branch/worktree in the Graph without checking it out. Arrow through the Graph (or Changes) pane and the right-side Preview updates instantly. No modal popups for casual browsing — `Enter` opens the full-screen view only when you want more room to scroll. Mouse works too: left-click any pane to focus + select, scroll wheel scrolls.
-
-**Origin sync at a glance**: the Graph header shows `main ↔ origin/main · ↑3 to push · ↓0 to pull` so you always know how far ahead/behind you are. Each unpushed commit gets a `↑` marker in the left margin.
-
-## Install
-
-### From source (works today)
-
-```sh
-git clone https://github.com/shreyashguptas/gsc
-cd gsc
-cargo install --path .
-```
-
-`gsc` lands in `~/.cargo/bin/`. Make sure that's on your `$PATH` (it is by default if you installed Rust via rustup).
-
-### Homebrew (planned for v0.2)
-
-```sh
-brew install shreyashguptas/tap/gsc
-```
-
-Wired up via [`cargo-dist`](https://opensource.axo.dev/cargo-dist/) — formula auto-publishes on tagged releases. See [Roadmap](#roadmap).
-
-### Requirements
-
-- macOS or Linux
-- `git` 2.30+ on `$PATH`
-- (Optional) [`gh`](https://cli.github.com) for PR / CI integration — `gsc` degrades gracefully if it's not installed
-- A terminal with truecolor + Unicode (any modern one: iTerm2, Ghostty, Warp, kitty, Alacritty, macOS Terminal, Windows Terminal)
+**The big idea**: arrow up/down on Branches previews that branch/worktree in the Graph without checking it out. Arrow through Graph (or Changes) and the right-side Preview updates instantly. No modal popups for casual browsing — `Enter` opens the full-screen view only when you want more room to scroll. Mouse works too.
 
 ## Usage
 
 ```sh
-cd /path/to/any/git/repo
-gsc
-```
-
-Other modes:
-
-```sh
+gsc                           # run on the current directory's repo
 gsc --path /elsewhere/repo    # operate on a repo outside cwd
-gsc -v                        # verbose logs to stderr (redirect to file to inspect)
+gsc -v                        # verbose logs to stderr
 gsc --help
 ```
 
 ## Mouse
 
-`gsc` accepts mouse input alongside the keyboard:
-
 | Action | Result |
 |---|---|
 | Left-click a pane | focus that pane and select the item under the cursor |
-| Click + drag a pane border | resize the panes (works for both vertical column borders and the branches/changes horizontal split) |
-| Scroll wheel inside a pane | scroll that pane (Preview scrolls its content; Branches/Changes/Graph move the selection) |
-| `=` key | reset all panes to default proportions if you've dragged things into a corner |
+| Click + drag a pane border | resize the panes |
+| Scroll wheel inside a pane | scroll that pane |
+| `=` key | reset all panes to default proportions |
 
-**macOS tip**: while mouse capture is on, normal text-selection in the terminal is intercepted. Hold **Option** while dragging to bypass capture and select text natively (works in Terminal, iTerm2, Ghostty, Warp, kitty).
+**macOS tip**: while mouse capture is on, normal text-selection in the terminal is intercepted. Hold **Option** while dragging to bypass capture and select text natively.
 
 ## Keybindings
 
@@ -122,12 +130,11 @@ gsc --help
 **Graph pane**
 | Key | Action |
 |---|---|
-| `↑↓` `j k` | scroll — Preview pane (right column) updates automatically |
-| `Enter` | open the diff full-screen (more room to scroll) |
+| `↑↓` `j k` | scroll — Preview pane updates automatically |
+| `Enter` | open the diff full-screen |
 | `o` | open commit on github.com |
 
-**Preview pane (right column)**
-The Preview pane updates automatically as the Graph or Changes selection moves — no keystrokes needed. It shows the file diff (Changes pane) or `git show` output (Graph pane) for whatever's currently selected. Hides automatically when the terminal is narrower than 130 cols.
+The Preview pane updates automatically as the Graph or Changes selection moves. Hides automatically when the terminal is narrower than 130 cols.
 
 ## What `gsc` is — and isn't
 
@@ -138,13 +145,23 @@ The Preview pane updates automatically as the Graph or Changes selection moves �
 - Fast: subprocess to system `git`, async I/O on Tokio, never blocks the UI
 
 **Isn't** (for now):
-- A replacement for `git` — drop to `git` for rebase, cherry-pick, stash, bisect, submodule ops, etc.
-- An interactive rebase TUI (use `lazygit` or `git rebase -i` for that)
+- A replacement for `git` — drop to `git` for rebase, cherry-pick, stash, bisect, submodule ops
+- An interactive rebase TUI (use `lazygit` or `git rebase -i`)
 - A merge conflict resolver
 
-The philosophy: do the VS Code panel really well, leave the rest to git.
+## Tests
 
-## Architecture (90-second tour)
+```sh
+cargo test
+```
+
+`tests/graph_render.rs` is an integration test that prints the rendered glyph grid to stdout — useful for visual debugging:
+
+```sh
+cargo test --test graph_render -- --nocapture
+```
+
+## Architecture (60-second tour)
 
 ```
 src/
@@ -153,56 +170,23 @@ src/
 ├── app.rs          App state + central Update loop
 ├── event.rs        AppEvent enum + crossterm/tick/signal tasks
 ├── git/            subprocess wrappers (no libgit2)
-│   ├── repo.rs        discovery + HEAD
-│   ├── branches.rs    `git for-each-ref` parser
-│   ├── log.rs         `git log --all` DAG fetcher
-│   ├── status.rs      `git status --porcelain=v2` parser
-│   ├── diff.rs        `git diff` / `git show` + line classifier
-│   └── ops.rs         stage / commit / push / checkout / branch / merge
 ├── gh/             `gh` CLI wrappers (PR chips, auth detect)
 ├── graph/          DAG layout + Unicode glyph rendering
-│   ├── lanes.rs       lane allocation algorithm
-│   ├── render.rs      ●/│/╮/╭/╯/╰/─ 2-char cell builder
-│   └── color.rs       branch-name → palette index (stable colors)
-├── ui/
-│   ├── view.rs        top-level layout
-│   ├── theme.rs       all colors in one place (swap = re-theme)
-│   └── panes/         branches, changes, graph, details, confirm, help, commit_input
+├── ui/             panes, theme, top-level layout
 └── watcher.rs      `notify` watcher on .git/ → instant refresh
 ```
 
-Three rules the architecture follows:
+Three rules:
 
-1. **No libgit2.** `gsc` shells out to system `git`. This means it honors your config, signing keys, hooks, credential helpers, sparse checkouts, and worktrees — for free. It also keeps the binary slim (~6 MB stripped).
-2. **Never block the UI.** Every git/gh call is a `tokio::process::Command` spawned as a `tokio::task`; the result comes back through an `mpsc` channel as an `AppEvent`. The render loop reads state and paints; it never awaits.
-3. **One Theme, one place.** All colors and styles live in [`src/ui/theme.rs`](src/ui/theme.rs). A future config can swap the whole palette without touching pane code.
-
-## Tests
-
-```sh
-cargo test
-```
-
-Covers the porcelain v2 status parser, the `git log` parser, the `for-each-ref` branch parser, the diff line classifier, and the lane allocator (linear / merge / multi-tip topologies). `tests/graph_render.rs` is an integration test that prints the rendered glyph grid to stdout — useful for visual debugging:
-
-```sh
-cargo test --test graph_render -- --nocapture
-```
+1. **No libgit2.** `gsc` shells out to system `git`, so it honors your config, signing keys, hooks, credential helpers, sparse checkouts, and worktrees — for free. Slim binary too (~6 MB stripped).
+2. **Never block the UI.** Every git/gh call is a `tokio::process::Command` spawned as a `tokio::task`; results come back through an `mpsc` channel as an `AppEvent`.
+3. **One Theme, one place.** All colors live in [`src/ui/theme.rs`](src/ui/theme.rs).
 
 ## Roadmap
 
-v0.2 (next):
-- `cargo-dist` for prebuilt binaries + Homebrew tap
-- Sub-row "transition" rendering for the graph (matches `git log --graph` exactly on multi-merge rows)
-- Stash list pane (`s`)
-- Theme presets (Dracula, Nord, GitHub Light, Solarized)
-- syntect syntax highlighting in diff bodies
+**v0.2 (next):** Homebrew tap via `cargo-dist`, sub-row graph transitions, stash list pane, theme presets (Dracula, Nord, GitHub Light, Solarized), syntect syntax highlighting in diff bodies.
 
-v1.0:
-- Conflict-resolver overlay (3-way diff for merge conflicts)
-- Interactive rebase TUI (`R` on a commit)
-- Cherry-pick, revert from the graph
-- `:command` palette for everything
+**v1.0:** Conflict-resolver overlay (3-way diff), interactive rebase TUI, cherry-pick / revert from the graph, `:command` palette.
 
 Have an idea? Open an issue.
 

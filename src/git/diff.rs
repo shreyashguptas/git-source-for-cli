@@ -18,15 +18,15 @@ pub async fn file(repo_root: &Path, path: &str, staged: bool) -> Result<String> 
 
 /// Combined diff for an untracked file: shows the whole file as additions.
 pub async fn untracked(repo_root: &Path, path: &str) -> Result<String> {
-    // `git diff --no-index /dev/null <path>` returns non-zero when there's a diff,
-    // so we use run_optional and treat None as "no diff" (empty file).
-    let none = "/dev/null";
-    Ok(exec::run_optional(
+    // `git diff --no-index /dev/null <path>` exits 1 whenever there's a diff
+    // (which is the only interesting case for a non-empty untracked file) and
+    // writes the diff to stdout. Capture stdout regardless of exit status —
+    // exit 0 just means the file was identical to /dev/null (i.e. empty).
+    exec::run_capture(
         repo_root,
-        ["diff", "--no-color", "--no-index", "--", none, path],
+        ["diff", "--no-color", "--no-index", "--", "/dev/null", path],
     )
-    .await?
-    .unwrap_or_default())
+    .await
 }
 
 /// Full staged diff (everything in the index vs. HEAD). Empty string when
