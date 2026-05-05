@@ -1313,6 +1313,12 @@ impl App {
                     && !self.input.buf.trim().is_empty()
                 {
                     self.do_commit().await;
+                } else if self.input_mode != InputMode::Commit
+                    && self.status.files.is_empty()
+                {
+                    // No working-tree changes and no in-flight input — opening
+                    // an empty commit box would just frustrate the user.
+                    self.toast = Some("nothing to commit".to_string());
                 } else {
                     self.input_mode = InputMode::Commit;
                     self.input.clear();
@@ -1325,6 +1331,14 @@ impl App {
                 {
                     self.input.push_after = true;
                     self.do_commit().await;
+                } else if self.input_mode != InputMode::Commit
+                    && self.status.files.is_empty()
+                {
+                    // Nothing to commit — fall through to a plain push of the
+                    // current branch. Same code path as the Branches-pane Push
+                    // button, so this button stays useful after the user has
+                    // already committed locally.
+                    self.spawn_push();
                 } else {
                     self.input_mode = InputMode::Commit;
                     self.input.clear();

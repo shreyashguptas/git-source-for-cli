@@ -14,13 +14,14 @@ use crate::{
 };
 
 /// Toolbar definition. Order is what the user sees left-to-right.
+// Grouped left-to-right: commit actions · staging actions · inspect/recovery · utility.
 const BUTTONS: &[(&str, ChangeAction)] = &[
     ("✓ commit", ChangeAction::Commit),
     ("⇡ commit & push", ChangeAction::CommitAndPush),
     ("✨ generate message", ChangeAction::AiMessage),
-    ("≣ view all", ChangeAction::ViewAll),
     ("+ stage all", ChangeAction::StageAll),
     ("− unstage all", ChangeAction::UnstageAll),
+    ("≣ view all", ChangeAction::ViewAll),
     ("↶ uncommit", ChangeAction::Uncommit),
     ("↻ refresh", ChangeAction::Refresh),
 ];
