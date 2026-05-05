@@ -60,6 +60,13 @@ cargo install --path . --force
 - `git` 2.30+ on `$PATH`
 - A terminal with truecolor + Unicode (iTerm2, Ghostty, Warp, kitty, Alacritty, macOS Terminal, Windows Terminal — any modern one)
 - (Optional) [`gh`](https://cli.github.com) for PR / CI integration — `gsc` degrades gracefully if it's not installed
+- (Optional) A [**Nerd Font**](https://nerdfonts.com) for the language logos in front of file names (the Rust crab, the TypeScript T, the Markdown down-arrow, …). Without one, the icons render as missing-glyph boxes — text is fine, just no logos. Install + select on macOS:
+
+  ```sh
+  brew install --cask font-jetbrains-mono-nerd-font
+  ```
+
+  Then point your terminal's font setting at `JetBrainsMono Nerd Font` (or any Nerd Font — `Hack Nerd Font`, `FiraCode Nerd Font`, `MesloLGS NF` all work). Nerd Fonts is the open-source project that bakes Devicons / Material-Design / Seti / Font-Awesome SVGs into a font so a TUI can render them — terminals can only display font glyphs, not raster or vector images.
 
 ## Reading the graph at a glance
 

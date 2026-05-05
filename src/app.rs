@@ -809,11 +809,12 @@ impl App {
             KeyCode::Char('m') if self.active_pane == Pane::Branches => self.confirm_merge(),
             KeyCode::Char('o') => self.open_in_browser(),
 
-            // Open the Ollama model picker. Only opens when ollama is reachable
-            // and has at least one model available.
-            KeyCode::Char('M') => self.open_model_picker(),
             // Open the Settings modal — ',' is a common "preferences" mnemonic
-            // (Cmd-, on macOS apps).
+            // (Cmd-, on macOS apps). The model picker is reachable from there
+            // (and from the `ollama: ✓ …` chip in the status bar). A bare `M`
+            // shortcut used to open the picker directly, but `M` collides with
+            // vim's "middle of screen" muscle memory and was opening it during
+            // navigation; that path was removed.
             KeyCode::Char(',') => self.open_settings(),
             _ => {}
         }
@@ -1702,11 +1703,6 @@ impl App {
                 let row = state.selected;
                 self.activate_settings_row(row);
             }
-            // Direct shortcut to open the picker even from inside settings.
-            KeyCode::Char('M') => {
-                self.settings = None;
-                self.open_model_picker();
-            }
             _ => {}
         }
     }
@@ -2483,13 +2479,16 @@ impl App {
         let tx = self.events_tx.clone();
         let root = self.repo.root.clone();
         tokio::spawn(async move {
-            match gh::fetch_prs(&root).await {
-                Ok(map) => {
-                    let _ = tx.send(AppEvent::PrsLoaded(map)).await;
-                }
-                Err(e) => {
-                    let _ = tx.send(AppEvent::LoadFailed(format!("gh prs: {e}"))).await;
-                }
+            // PR data is enhancement-only — branches/commits/diffs all work
+            // without it. We refresh at most once a minute (well under
+            // GitHub's 5000/hr authed budget), so most failures here are
+            // transient: 5xx gateway timeouts, network blips, rate-limited
+            // CI runners. Toasting every transient blip is more noise than
+            // signal; cached PR chips stay visible until the next refresh
+            // succeeds. Persistent failures still surface on the next manual
+            // `r` refresh path or via gh availability changes.
+            if let Ok(map) = gh::fetch_prs(&root).await {
+                let _ = tx.send(AppEvent::PrsLoaded(map)).await;
             }
         });
     }

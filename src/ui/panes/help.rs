@@ -131,7 +131,6 @@ fn build_lines(theme: &Theme) -> Vec<Line<'static>> {
         head("Ollama (local AI commit messages)"),
         row("Ctrl-G", "stage some files, then press Ctrl-G — Ollama writes the subject"),
         row(",", "open settings (model + base URL + system prompt)"),
-        row("M", "open model picker directly — type to filter, ↑↓ + Enter pick"),
         row("status bar", "click `ollama: ✓ <model>` to switch model; click `⚙ settings` to open settings"),
         row("config", "~/.config/gsc/config.json (base_url, model, system_prompt)"),
     ]
